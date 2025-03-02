@@ -27,6 +27,7 @@ from gpu4pyscf.dft import rks, uks, numint
 from gpu4pyscf.scf import hf, uhf
 from gpu4pyscf.df import df, int3c2e
 from gpu4pyscf.__config__ import _streams, num_devices
+import pdb
 
 def _pin_memory(array):
     mem = cupy.cuda.alloc_pinned_memory(array.nbytes)
@@ -132,6 +133,8 @@ class _DFHF:
         self.direct_scf = False
         self.with_df = dfobj
         self.only_dfj = only_dfj
+        self.enable_mxp_df = False
+        self.mxp_df_dtype = 'float64'
 
     def undo_df(self):
         '''Remove the DFHF Mixin'''
@@ -145,6 +148,12 @@ class _DFHF:
 
     init_workflow = init_workflow
 
+    dtype_map = {
+        'float64': cupy.float64,
+        'float32': cupy.float32,
+        'float16': cupy.float16
+    }
+
     def get_jk(self, mol=None, dm=None, hermi=1, with_j=True, with_k=True,
                omega=None):
         if dm is None: dm = self.make_rdm1()
@@ -156,8 +165,12 @@ class _DFHF:
             if with_k:
                 vk = super().get_jk(mol, dm, hermi, False, True, omega)[1]
         elif self.with_df:
+            if hasattr(self, 'enable_mxp_df') and self.enable_mxp_df:
+                mxp_df_dtype = self.dtype_map[self.mxp_df_dtype]
+            else:
+                mxp_df_dtype = cupy.float64
             vj, vk = self.with_df.get_jk(dm, hermi, with_j, with_k,
-                                         self.direct_scf_tol, omega)
+                                         self.direct_scf_tol, omega, mxp_df_dtype)
         else:
             vj, vk = super().get_jk(mol, dm, hermi, with_j, with_k, omega)
         return vj, vk
@@ -242,7 +255,8 @@ class _DFHF:
         return utils.to_cpu(self, obj)
 
 def _jk_task_with_mo(dfobj, dms, mo_coeff, mo_occ,
-                     with_j=True, with_k=True, hermi=0, device_id=0):
+                     with_j=True, with_k=True, hermi=0, device_id=0,
+                     mxp_df_dtype=cupy.float64):
     ''' Calculate J and K matrices on single GPU
     '''
     with cupy.cuda.Device(device_id), _streams[device_id]:
@@ -270,6 +284,7 @@ def _jk_task_with_mo(dfobj, dms, mo_coeff, mo_occ,
         if with_k:
             vk = cupy.zeros_like(dms)
 
+        enable_mxp = (mxp_df_dtype != cupy.float64)
         # SCF K matrix with occ
         if mo_coeff is not None:
             assert hermi == 1
@@ -288,13 +303,24 @@ def _jk_task_with_mo(dfobj, dms, mo_coeff, mo_occ,
                     rhoj = dm_sparse.dot(cderi_sparse)
                     vj_packed += cupy.dot(rhoj, cderi_sparse.T)
                 cderi_sparse = rhoj = None
-                for i in range(nset):
-                    if with_k:
-                        rhok = contract('Lji,jk->Lki', cderi, occ_coeff[i])
-                        # In most cases, syrk does not outperform cupy.dot
-                        #cublas.syrk('T', rhok.reshape([-1,nao]), out=vk[i], alpha=1.0, beta=1.0, lower=True)
-                        rhok = rhok.reshape([-1,nao])
-                        vk[i] += cupy.dot(rhok.T, rhok)
+                if with_k:
+                    if enable_mxp:
+                        cderi_mxp = cderi.astype(mxp_df_dtype)
+                    for i in range(nset):
+                        if enable_mxp:
+                            occ_coeff_i_mxp = occ_coeff[i].astype(mxp_df_dtype)
+                            rhok_mxp = contract('Lij,jk->Lki', cderi_mxp, occ_coeff_i_mxp)
+                            rhok_mxp = rhok_mxp.reshape([-1,nao])
+                            syrk_mxp = cupy.dot(rhok_mxp.T, rhok_mxp)
+                            vk[i] += syrk_mxp.astype(vk[i].dtype)
+                            rhok_mxp = None
+                            syrk_mxp = None
+                        else:
+                            rhok = contract('Lji,jk->Lki', cderi, occ_coeff[i])
+                            # In most cases, syrk does not outperform cupy.dot
+                            #cublas.syrk('T', rhok.reshape([-1,nao]), out=vk[i], alpha=1.0, beta=1.0, lower=True)
+                            rhok = rhok.reshape([-1,nao])
+                            vk[i] += cupy.dot(rhok.T, rhok)
                     rhok = None
 
             if with_j:
@@ -305,7 +331,8 @@ def _jk_task_with_mo(dfobj, dms, mo_coeff, mo_occ,
     return vj, vk
 
 def _jk_task_with_mo1(dfobj, dms, mo1s, occ_coeffs,
-                      with_j=True, with_k=True, hermi=0, device_id=0):
+                      with_j=True, with_k=True, hermi=0, device_id=0,
+                      mxp_df_dtype=cupy.float64):
     ''' Calculate J and K matrices with mo response
         For CP-HF or TDDFT
     '''
@@ -337,6 +364,7 @@ def _jk_task_with_mo1(dfobj, dms, mo1s, occ_coeffs,
         if with_j:
             vj_sparse = cupy.zeros_like(dm_sparse)
 
+        enable_mxp = (mxp_df_dtype != cupy.float64)
         nocc = max([mo1.shape[2] for mo1 in mo1s])
         blksize = dfobj.get_blksize(extra=2*nao*nocc)
         for cderi, cderi_sparse in dfobj.loop(blksize=blksize, unpack=with_k):
@@ -347,13 +375,24 @@ def _jk_task_with_mo1(dfobj, dms, mo1s, occ_coeffs,
             cderi_sparse = None
             if with_k:
                 iset = 0
+                if enable_mxp:
+                    cderi_mxp = cderi.astype(mxp_df_dtype)
                 for occ_coeff, mo1 in zip(occ_coeffs, mo1s):
-                    rhok = contract('Lij,jk->Lki', cderi, occ_coeff).reshape([-1,nao])
-                    for i in range(mo1.shape[0]):
-                        rhok1 = contract('Lij,jk->Lki', cderi, mo1[i]).reshape([-1,nao])
-                        #contract('Lki,Lkj->ij', rhok1, rhok, alpha=1.0, beta=1.0, out=vk[iset])
-                        vk[iset] += cupy.dot(rhok1.T, rhok)
-                        iset += 1
+                    if enable_mxp:
+                        occ_coeff_mxp = occ_coeff.astype(mxp_df_dtype)
+                        rhok_mxp = contract('Lij,jk->Lki', cderi_mxp, occ_coeff_mxp).reshape([-1,nao])
+                        for i in range(mo1.shape[0]):
+                            mo1_i_mxp = mo1[i].astype(mxp_df_dtype)
+                            rhok1_mxp = contract('Lij,jk->Lki', cderi_mxp, mo1_i_mxp).reshape([-1,nao])
+                            vk[iset] += cupy.dot(rhok1_mxp.T, rhok_mxp).astype(vk[iset].dtype)
+                            iset += 1
+                    else:
+                        rhok = contract('Lij,jk->Lki', cderi, occ_coeff).reshape([-1,nao])
+                        for i in range(mo1.shape[0]):
+                            rhok1 = contract('Lij,jk->Lki', cderi, mo1[i]).reshape([-1,nao])
+                            #contract('Lki,Lkj->ij', rhok1, rhok, alpha=1.0, beta=1.0, out=vk[iset])
+                            vk[iset] += cupy.dot(rhok1.T, rhok)
+                            iset += 1
                 mo1 = rhok1 = rhok = None
             cderi = None
         mo1s = None
@@ -368,7 +407,7 @@ def _jk_task_with_mo1(dfobj, dms, mo1s, occ_coeffs,
         t0 = log.timer_debug1(f'vj and vk on Device {device_id}', *t0)
     return vj, vk
 
-def _jk_task_with_dm(dfobj, dms, with_j=True, with_k=True, hermi=0, device_id=0):
+def _jk_task_with_dm(dfobj, dms, with_j=True, with_k=True, hermi=0, device_id=0, mxp_df_dtype=cupy.float64):
     ''' Calculate J and K matrices with density matrix
     '''
     with cupy.cuda.Device(device_id), _streams[device_id]:
@@ -394,6 +433,7 @@ def _jk_task_with_dm(dfobj, dms, with_j=True, with_k=True, hermi=0, device_id=0)
         if with_k:
             vk = cupy.zeros_like(dms)
 
+        enable_mxp = (mxp_df_dtype != cupy.float64)
         nset = dms.shape[0]
         blksize = dfobj.get_blksize()
         for cderi, cderi_sparse in dfobj.loop(blksize=blksize, unpack=with_k):
@@ -401,10 +441,17 @@ def _jk_task_with_dm(dfobj, dms, with_j=True, with_k=True, hermi=0, device_id=0)
                 rhoj = dm_sparse.dot(cderi_sparse)
                 vj_sparse += cupy.dot(rhoj, cderi_sparse.T)
             if with_k:
-                for k in range(nset):
-                    rhok = contract('Lij,jk->Lki', cderi, dms[k]).reshape([-1,nao])
-                    #vk[k] += contract('Lki,Lkj->ij', rhok, cderi)
-                    vk[k] += cupy.dot(rhok.T, cderi.reshape([-1,nao]))
+                if enable_mxp:
+                    cderi_mxp = cderi.astype(mxp_df_dtype)
+                    for k in range(nset):
+                        dms_k_exp = dms[k].astype(mxp_df_dtype)
+                        rhok_mxp = contract('Lij,jk->Lki', cderi_mxp, dms_k_exp).reshape([-1,nao])
+                        vk[k] += cupy.dot(rhok_mxp.T, cderi_mxp.reshape([-1,nao])).astype(vk[k].dtype)
+                else:
+                    for k in range(nset):
+                        rhok = contract('Lij,jk->Lki', cderi, dms[k]).reshape([-1,nao])
+                        #vk[k] += contract('Lki,Lkj->ij', rhok, cderi)
+                        vk[k] += cupy.dot(rhok.T, cderi.reshape([-1,nao]))
         if with_j:
             vj = cupy.zeros(dms_shape)
             vj[:,rows,cols] = vj_sparse
@@ -413,7 +460,7 @@ def _jk_task_with_dm(dfobj, dms, with_j=True, with_k=True, hermi=0, device_id=0)
         t0 = log.timer_debug1(f'vj and vk on Device {device_id}', *t0)
     return vj, vk
 
-def get_jk(dfobj, dms_tag, hermi=0, with_j=True, with_k=True, direct_scf_tol=1e-14, omega=None):
+def get_jk(dfobj, dms_tag, hermi=0, with_j=True, with_k=True, direct_scf_tol=1e-14, omega=None, mxp_df_dtype=cupy.float64):
     '''
     get jk with density fitting
     outputs and input are on the same device
@@ -459,7 +506,8 @@ def get_jk(dfobj, dms_tag, hermi=0, with_j=True, with_k=True, direct_scf_tol=1e-
                     _jk_task_with_mo,
                     dfobj, dms, mo_coeff, mo_occ,
                     hermi=hermi, device_id=device_id,
-                    with_j=with_j, with_k=with_k)
+                    with_j=with_j, with_k=with_k,
+                    mxp_df_dtype=mxp_df_dtype)
                 futures.append(future)
 
     elif hasattr(dms_tag, 'mo1'):
@@ -480,7 +528,8 @@ def get_jk(dfobj, dms_tag, hermi=0, with_j=True, with_k=True, direct_scf_tol=1e-
                     _jk_task_with_mo1,
                     dfobj, dms, mo1s, occ_coeffs,
                     hermi=hermi, device_id=device_id,
-                    with_j=with_j, with_k=with_k)
+                    with_j=with_j, with_k=with_k,
+                    mxp_df_dtype=mxp_df_dtype)
                 futures.append(future)
 
     # general K matrix with density matrix
@@ -491,7 +540,8 @@ def get_jk(dfobj, dms_tag, hermi=0, with_j=True, with_k=True, direct_scf_tol=1e-
                 future = executor.submit(
                     _jk_task_with_dm, dfobj, dms,
                     hermi=hermi, device_id=device_id,
-                    with_j=with_j, with_k=with_k)
+                    with_j=with_j, with_k=with_k,
+                    mxp_df_dtype=mxp_df_dtype)
                 futures.append(future)
 
     vj = vk = None

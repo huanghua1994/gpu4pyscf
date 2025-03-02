@@ -155,9 +155,9 @@ class DF(lib.StreamObject):
 
     def get_jk(self, dm, hermi=1, with_j=True, with_k=True,
                direct_scf_tol=getattr(__config__, 'scf_hf_SCF_direct_scf_tol', 1e-13),
-               omega=None):
+               omega=None, mxp_df_dtype=cupy.float64):
         if omega is None:
-            return df_jk.get_jk(self, dm, hermi, with_j, with_k, direct_scf_tol)
+            return df_jk.get_jk(self, dm, hermi, with_j, with_k, direct_scf_tol, mxp_df_dtype=mxp_df_dtype)
         assert omega >= 0.0
 
         # A temporary treatment for RSH-DF integrals

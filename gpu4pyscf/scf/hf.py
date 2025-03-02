@@ -197,6 +197,7 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
         # Note in pbc.scf, mf.mol == mf.cell, cell is saved under key "mol"
         chkfile.save_mol(mol, mf.chkfile)
 
+    last_delta_e = e_tot
     for cycle in range(mf.max_cycle):
         t0 = log.init_timer()
         dm_last = dm
@@ -209,6 +210,15 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
         mo_occ = mf.get_occ(mo_energy, mo_coeff)
         dm = mf.make_rdm1(mo_coeff, mo_occ)
         t1 = log.timer_debug1('dm', *t1)
+        if hasattr(mf, 'enable_mxp_df') and mf.enable_mxp_df:
+            relative_delta_e = abs(last_delta_e) / abs(last_hf_e)
+            if relative_delta_e > 1e-3:
+                mf.mxp_df_dtype = 'float16'
+            elif relative_delta_e > 1e-6:
+                mf.mxp_df_dtype = 'float32'
+            else:
+                mf.mxp_df_dtype = 'float64'
+            logger.info(mf, 'cycle=%d, mxp_df_dtype set to %s', cycle+1, mf.mxp_df_dtype)
         vhf = mf.get_veff(mol, dm, dm_last, vhf)
         t1 = log.timer_debug1('veff', *t1)
         e_tot = mf.energy_tot(dm, h1e, vhf)
@@ -216,8 +226,9 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
 
         norm_ddm = cupy.linalg.norm(dm-dm_last)
         t1 = log.timer_debug1('total', *t0)
+        last_delta_e = e_tot - last_hf_e
         logger.info(mf, 'cycle= %d E= %.15g  delta_E= %4.3g  |ddm|= %4.3g',
-                    cycle+1, e_tot, e_tot-last_hf_e, norm_ddm)
+                    cycle+1, e_tot, last_delta_e, norm_ddm)
 
         if dump_chk:
             mf.dump_chk(locals())
