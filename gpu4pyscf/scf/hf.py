@@ -197,6 +197,16 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
         # Note in pbc.scf, mf.mol == mf.cell, cell is saved under key "mol"
         chkfile.save_mol(mol, mf.chkfile)
 
+    last_delta_e = e_tot
+    if hasattr(mf, 'mxp_df_level'):
+        if mf.mxp_df_level < 0 or mf.mxp_df_level > 2:
+            logger.warn(mf, "Invalide mxp_df_level value %d, set to 0", mf.mxp_df_level)
+            mf.mxp_df_level = 0
+        curr_mxp_level = mf.mxp_df_level
+    fp16_iters = 0
+    fp32_iters = 0
+    fp64_iters = 0
+    max_fp16_iter = 5
     for cycle in range(mf.max_cycle):
         t0 = log.init_timer()
         dm_last = dm
@@ -209,6 +219,20 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
         mo_occ = mf.get_occ(mo_energy, mo_coeff)
         dm = mf.make_rdm1(mo_coeff, mo_occ)
         t1 = log.timer_debug1('dm', *t1)
+        if hasattr(mf, 'mxp_df_level'):
+            relative_delta_e = abs(last_delta_e) / abs(last_hf_e)
+            if (relative_delta_e > 1e-3) and (mf.mxp_df_level == 2) and (curr_mxp_level == 2) and (fp16_iters < max_fp16_iter):
+                mf.mxp_df_dtype = 'float16'
+                fp16_iters += 1
+            elif (relative_delta_e > 1e-6) and (mf.mxp_df_level >= 1) and (curr_mxp_level >= 1):
+                mf.mxp_df_dtype = 'float32'
+                fp32_iters += 1
+                curr_mxp_level = 1
+            else:
+                mf.mxp_df_dtype = 'float64'
+                fp64_iters += 1
+                curr_mxp_level = 0
+            logger.info(mf, 'cycle=%d, mxp_df_dtype set to %s', cycle+1, mf.mxp_df_dtype)
         vhf = mf.get_veff(mol, dm, dm_last, vhf)
         t1 = log.timer_debug1('veff', *t1)
         e_tot = mf.energy_tot(dm, h1e, vhf)
@@ -216,8 +240,9 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
 
         norm_ddm = cupy.linalg.norm(dm-dm_last)
         t1 = log.timer_debug1('total', *t0)
+        last_delta_e = e_tot - last_hf_e
         logger.info(mf, 'cycle= %d E= %.15g  delta_E= %4.3g  |ddm|= %4.3g',
-                    cycle+1, e_tot, e_tot-last_hf_e, norm_ddm)
+                    cycle+1, e_tot, last_delta_e, norm_ddm)
 
         if dump_chk:
             mf.dump_chk(locals())
@@ -229,6 +254,8 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
             break
     else:
         logger.warn(mf, "SCF failed to converge")
+
+    logger.info(mf, '\nSCF iters in FP16: %d, FP32: %d, FP64: %d\n', fp16_iters, fp32_iters, fp64_iters)
 
     return scf_conv, e_tot, mo_energy, mo_coeff, mo_occ
 

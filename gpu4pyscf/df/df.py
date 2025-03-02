@@ -57,6 +57,8 @@ class DF(lib.StreamObject):
         self._cderi = None
         self._vjopt = None
         self._rsh_df = {}
+        self._cderi_scale = {}
+        self._last_blksize = {}
 
     __getstate__, __setstate__ = lib.generate_pickle_methods(
         excludes=('cd_low', 'intopt', '_cderi', '_vjopt'))
@@ -155,9 +157,9 @@ class DF(lib.StreamObject):
 
     def get_jk(self, dm, hermi=1, with_j=True, with_k=True,
                direct_scf_tol=getattr(__config__, 'scf_hf_SCF_direct_scf_tol', 1e-13),
-               omega=None):
+               omega=None, mxp_df_dtype=cupy.float64):
         if omega is None:
-            return df_jk.get_jk(self, dm, hermi, with_j, with_k, direct_scf_tol)
+            return df_jk.get_jk(self, dm, hermi, with_j, with_k, direct_scf_tol, mxp_df_dtype=mxp_df_dtype)
         assert omega >= 0.0
 
         # A temporary treatment for RSH-DF integrals
@@ -176,15 +178,56 @@ class DF(lib.StreamObject):
         '''
         if nao is None: nao = self.nao
         mem_avail = get_avail_mem()
-        blksize = int(mem_avail*0.2/8/(nao*nao + extra) / ALIGNED) * ALIGNED
-        blksize = min(blksize, MIN_BLK_SIZE)
+        blksize = int(mem_avail*0.5/8/(nao*nao + extra) / ALIGNED) * ALIGNED
+        #blksize = min(blksize, MIN_BLK_SIZE)
         log = logger.new_logger(self.mol, self.mol.verbose)
         device_id = cupy.cuda.Device().id
         log.debug(f"{mem_avail/1e9:.3f} GB memory available on Device {device_id}, block size = {blksize}")
         assert blksize > 0
         return blksize
 
-    def loop(self, blksize=None, unpack=True):
+    def cderi_calc_scale_factor(self, blksize):
+        '''
+        Loop over cderi for the current device and compute fp32 & fp16 scale factors
+        '''
+        device_id = cupy.cuda.Device().id
+        old_blksize = self._last_blksize.get(device_id, None)
+        # Recalc scale factors when blksize changed
+        if old_blksize is not None and old_blksize == blksize:
+            return
+
+        cderi_sparse = self._cderi[device_id]
+        naux_slice = cderi_sparse.shape[0]
+        n_slice = (naux_slice + blksize - 1) // blksize
+
+        self._cderi_scale[device_id] = cupy.ones([n_slice], dtype=cupy.float64)
+        self._last_blksize[device_id] = blksize
+
+        buf_prefetch = None
+        for p0, p1 in lib.prange(0, naux_slice, blksize):
+            index = p0 // blksize
+            p2 = min(naux_slice, p1 + blksize)
+            if isinstance(cderi_sparse, cupy.ndarray):
+                buf = cderi_sparse[p0:p1,:]
+            if isinstance(cderi_sparse, np.ndarray):
+                # first block
+                if buf_prefetch is None:
+                    buf = cupy.asarray(cderi_sparse[p0:p1,:])
+                buf_prefetch = cupy.empty([p2-p1,cderi_sparse.shape[1]])
+            if isinstance(cderi_sparse, np.ndarray) and p1 < p2:
+                buf_prefetch.set(cderi_sparse[p1:p2,:])
+            abs_max = cupy.absolute(buf).max()
+
+            p = cupy.ceil(3.0 - cupy.log2(abs_max))
+            scale = cupy.power(2.0, p)
+            self._cderi_scale[device_id][index] = scale
+
+            if isinstance(cderi_sparse, np.ndarray):
+                cupy.cuda.Device().synchronize()
+            if buf_prefetch is not None:
+                buf = buf_prefetch
+
+    def loop(self, blksize=None, unpack=True, unpack_dtype=cupy.float64):
         ''' loop over cderi for the current device
             and unpack the CDERI in (Lij) format
         '''
@@ -197,8 +240,9 @@ class DF(lib.StreamObject):
         rows = self.intopt.cderi_row
         cols = self.intopt.cderi_col
         buf_prefetch = None
-        buf_cderi = cupy.zeros([blksize,nao,nao])
+        buf_cderi = cupy.zeros([blksize,nao,nao], dtype=unpack_dtype)
         for p0, p1 in lib.prange(0, naux_slice, blksize):
+            index = p0 // blksize
             p2 = min(naux_slice, p1+blksize)
             if isinstance(cderi_sparse, cupy.ndarray):
                 buf = cderi_sparse[p0:p1,:]
@@ -210,12 +254,20 @@ class DF(lib.StreamObject):
             if isinstance(cderi_sparse, np.ndarray) and p1 < p2:
                 buf_prefetch.set(cderi_sparse[p1:p2,:])
             if unpack:
-                buf_cderi[:p1-p0,rows,cols] = buf
-                buf_cderi[:p1-p0,cols,rows] = buf
+                if (unpack_dtype == cupy.float16):
+                    scale = self._cderi_scale[device_id][index].astype(unpack_dtype)
+                    scale_inv2 = 1.0 / (scale * scale)
+                    buf_cast = buf.astype(unpack_dtype) * scale
+                else:
+                    scale_inv2 = 1.0
+                    buf_cast = buf
+                buf_cderi[:p1-p0,rows,cols] = buf_cast
+                buf_cderi[:p1-p0,cols,rows] = buf_cast
                 buf2 = buf_cderi[:p1-p0]
             else:
                 buf2 = None
-            yield buf2, buf.T
+                scale_inv2 = 1
+            yield buf2, buf.T, scale_inv2
             if isinstance(cderi_sparse, np.ndarray):
                 cupy.cuda.Device().synchronize()
 
@@ -256,7 +308,7 @@ def cholesky_eri_gpu(intopt, mol, auxmol, cd_low,
         # CDERI will be equally distributed to the devices
         # Other devices usually have more memory available than Device 0
         # CDERI will use up to 40% of the available memory
-        use_gpu_memory = naux * npairs * 8 < 0.4 * avail_mem * num_devices
+        use_gpu_memory = naux * npairs * 8 < 0.8 * avail_mem * num_devices
 
     if use_gpu_memory:
         log.debug("Saving CDERI on GPU")
