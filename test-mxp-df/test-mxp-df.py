@@ -12,7 +12,7 @@ def parse_arguments():
     parser.add_argument("--disable_mxp_df", action="store_false", dest="enable_mxp_df", help="Disable mixed precision DF.")
     parser.add_argument("--mol_verbose", type=int, default=5, help="Verbosity level for molecule information (default: 5).")
     parser.add_argument("--run_verbose", type=int, default=5, help="Verbosity level for SCF run (default: 5).")
-    parser.add_argument("--conv_tol", type=float, default=1e-10, help="SCF convergence tolerance (default: 1e-10).")
+    parser.add_argument("--conv_tol", type=float, default=1e-9, help="SCF convergence tolerance (default: 1e-9).")
     parser.add_argument("--max_cycle", type=int, default=50, help="Maximum SCF cycles (default: 50).")
     parser.add_argument("--max_memory", type=int, default=32768, help="Maximum memory in MB (default: 32768).")
     return parser.parse_args()
