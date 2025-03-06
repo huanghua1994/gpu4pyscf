@@ -297,6 +297,8 @@ def _jk_task_with_mo(dfobj, dms, mo_coeff, mo_occ,
             blksize = dfobj.get_blksize(extra=nao*nocc)
             if with_j:
                 vj_packed = cupy.zeros_like(dm_sparse)
+            if with_k and enable_mxp:
+                occ_coeff_mxp = [occ_coeff[i].astype(mxp_df_dtype) for i in range(nset)]
             for cderi, cderi_sparse in dfobj.loop(blksize=blksize, unpack=with_k):
                 # leading dimension is 1
                 if with_j:
@@ -308,8 +310,7 @@ def _jk_task_with_mo(dfobj, dms, mo_coeff, mo_occ,
                         cderi_mxp = cderi.astype(mxp_df_dtype)
                     for i in range(nset):
                         if enable_mxp:
-                            occ_coeff_i_mxp = occ_coeff[i].astype(mxp_df_dtype)
-                            rhok_mxp = contract('Lij,jk->Lki', cderi_mxp, occ_coeff_i_mxp)
+                            rhok_mxp = contract('Lij,jk->Lki', cderi_mxp, occ_coeff_mxp[i])
                             rhok_mxp = rhok_mxp.reshape([-1,nao])
                             syrk_mxp = cupy.dot(rhok_mxp.T, rhok_mxp)
                             vk[i] += syrk_mxp.astype(vk[i].dtype)
