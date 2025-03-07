@@ -1,7 +1,5 @@
 #!/bin/bash
 
-set -x
-
 time_now=$(date +%Y%m%d_%H%M%S)
 logdir="logs_$time_now"
 declare -a xyz_files
@@ -69,6 +67,14 @@ if [ ${#xyz_files[@]} -eq 0 ]; then
     )
 fi
 
+# Warn-up running
+echo "Warm-up running..."
+for mxp_df_level in "${mxp_df_levels[@]}"; do
+    python3 test-mxp-df.py data/organic/057_Tamoxifen.xyz ccpvdz DFT "--mxp_df_level" "$mxp_df_level" &> /tmp/mxp-df-warmup.log
+done
+
+# Run all tests
+echo "Start running tests..."
 for xyz_file in "${xyz_files[@]}"; do
     base_name=$(basename "$xyz_file" .xyz)
     for basis in "${basis_set[@]}"; do
