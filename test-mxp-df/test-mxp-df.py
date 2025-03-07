@@ -8,8 +8,7 @@ def parse_arguments():
     parser.add_argument("basis", type=str, help="Basis set type.")
     parser.add_argument("calc_type", type=str, choices=["HF", "DFT"], help="Calculation type: HF or DFT.")
     parser.add_argument("--xc", type=str, default="b3lyp", help="Exchange-correlation functional for DFT (default: b3lyp).")
-    parser.add_argument("--enable_mxp_df", action="store_true", help="Enable mixed precision DF (default: True).")
-    parser.add_argument("--disable_mxp_df", action="store_false", dest="enable_mxp_df", help="Disable mixed precision DF.")
+    parser.add_argument("--mxp_df_level", type=int, default=1, choices=range(0, 3), help="MxP DF level (default: 1). 0 == no MxP, 1 == allow FP32, 2 == allow FP32 and FP16.")
     parser.add_argument("--mol_verbose", type=int, default=5, help="Verbosity level for molecule information (default: 5).")
     parser.add_argument("--run_verbose", type=int, default=5, help="Verbosity level for SCF run (default: 5).")
     parser.add_argument("--conv_tol", type=float, default=1e-9, help="SCF convergence tolerance (default: 1e-9).")
@@ -44,8 +43,13 @@ def main():
     mf.conv_tol = args.conv_tol
     mf.max_cycle = args.max_cycle
     mf.verbose = args.run_verbose
-    mf.enable_mxp_df = args.enable_mxp_df
-    print(f"Enable mixed precision DF: {mf.enable_mxp_df}")
+    mf.mxp_df_level = args.mxp_df_level
+    if mf.mxp_df_level == 0:
+        print(f"\n!! Not using mixed precision DF.")
+    elif mf.mxp_df_level == 1:
+        print(f"\n!! Using mixed precision DF with FP32.")
+    elif mf.mxp_df_level == 2:
+        print(f"\n!! Using mixed precision DF with FP32 and FP16.")
     
     # Run calculation
     start_t = time.time()

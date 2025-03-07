@@ -133,7 +133,7 @@ class _DFHF:
         self.direct_scf = False
         self.with_df = dfobj
         self.only_dfj = only_dfj
-        self.enable_mxp_df = False
+        self.mxp_df_level = 0
         self.mxp_df_dtype = 'float64'
 
     def undo_df(self):
@@ -165,7 +165,7 @@ class _DFHF:
             if with_k:
                 vk = super().get_jk(mol, dm, hermi, False, True, omega)[1]
         elif self.with_df:
-            if hasattr(self, 'enable_mxp_df') and self.enable_mxp_df:
+            if hasattr(self, 'mxp_df_level'):
                 mxp_df_dtype = self.dtype_map[self.mxp_df_dtype]
             else:
                 mxp_df_dtype = cupy.float64

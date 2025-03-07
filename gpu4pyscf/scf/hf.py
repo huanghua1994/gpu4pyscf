@@ -198,6 +198,10 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
         chkfile.save_mol(mol, mf.chkfile)
 
     last_delta_e = e_tot
+    if hasattr(mf, 'mxp_df_level'):
+        if mf.mxp_df_level < 0 or mf.mxp_df_level > 2:
+            logger.warn(mf, "Invalide mxp_df_level value %d, set to 0", mf.mxp_df_level)
+            mf.mxp_df_level = 0
     for cycle in range(mf.max_cycle):
         t0 = log.init_timer()
         dm_last = dm
@@ -210,11 +214,11 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
         mo_occ = mf.get_occ(mo_energy, mo_coeff)
         dm = mf.make_rdm1(mo_coeff, mo_occ)
         t1 = log.timer_debug1('dm', *t1)
-        if hasattr(mf, 'enable_mxp_df') and mf.enable_mxp_df:
+        if hasattr(mf, 'mxp_df_level'):
             relative_delta_e = abs(last_delta_e) / abs(last_hf_e)
-            if relative_delta_e > 1e-3:
+            if (relative_delta_e > 1e-3) and (mf.mxp_df_level == 2):
                 mf.mxp_df_dtype = 'float16'
-            elif relative_delta_e > 1e-6:
+            elif (relative_delta_e > 1e-6) and (mf.mxp_df_level >= 1):
                 mf.mxp_df_dtype = 'float32'
             else:
                 mf.mxp_df_dtype = 'float64'
