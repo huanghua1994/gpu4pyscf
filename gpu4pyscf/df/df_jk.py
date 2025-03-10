@@ -27,7 +27,6 @@ from gpu4pyscf.dft import rks, uks, numint
 from gpu4pyscf.scf import hf, uhf
 from gpu4pyscf.df import df, int3c2e
 from gpu4pyscf.__config__ import _streams, num_devices
-import pdb
 
 def _pin_memory(array):
     mem = cupy.cuda.alloc_pinned_memory(array.nbytes)
@@ -299,18 +298,22 @@ def _jk_task_with_mo(dfobj, dms, mo_coeff, mo_occ,
                 vj_packed = cupy.zeros_like(dm_sparse)
             if with_k and enable_mxp:
                 occ_coeff_mxp = [occ_coeff[i].astype(mxp_df_dtype) for i in range(nset)]
-            for cderi, cderi_sparse in dfobj.loop(blksize=blksize, unpack=with_k):
+            for cderi, cderi_sparse in dfobj.loop(blksize=blksize, unpack=with_k, unpack_dtype=mxp_df_dtype):
                 # leading dimension is 1
                 if with_j:
                     rhoj = dm_sparse.dot(cderi_sparse)
                     vj_packed += cupy.dot(rhoj, cderi_sparse.T)
                 cderi_sparse = rhoj = None
                 if with_k:
-                    if enable_mxp:
-                        cderi_mxp = cderi.astype(mxp_df_dtype)
                     for i in range(nset):
                         if enable_mxp:
-                            rhok_mxp = contract('Lij,jk->Lki', cderi_mxp, occ_coeff_mxp[i])
+                            cderi_mxp = cderi
+                            curr_bs = cderi_mxp.shape[0]
+                            cderi_mxp.reshape([-1,nao])
+                            rhok_mxp = cupy.dot(cderi_mxp, occ_coeff_mxp[i])  # Lij,jk -> Lik
+                            nocc = occ_coeff_mxp[i].shape[1]
+                            rhok_mxp = rhok_mxp.reshape([curr_bs,nao,nocc])
+                            rhok_mxp = cupy.transpose(rhok_mxp, axes=(0,2,1))  # Lik -> Lki
                             rhok_mxp = rhok_mxp.reshape([-1,nao])
                             syrk_mxp = cupy.dot(rhok_mxp.T, rhok_mxp)
                             vk[i] += syrk_mxp.astype(vk[i].dtype)
