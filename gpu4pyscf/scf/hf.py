@@ -202,6 +202,7 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
         if mf.mxp_df_level < 0 or mf.mxp_df_level > 2:
             logger.warn(mf, "Invalide mxp_df_level value %d, set to 0", mf.mxp_df_level)
             mf.mxp_df_level = 0
+        curr_mxp_level = mf.mxp_df_level
     for cycle in range(mf.max_cycle):
         t0 = log.init_timer()
         dm_last = dm
@@ -216,12 +217,14 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
         t1 = log.timer_debug1('dm', *t1)
         if hasattr(mf, 'mxp_df_level'):
             relative_delta_e = abs(last_delta_e) / abs(last_hf_e)
-            if (relative_delta_e > 1e-3) and (mf.mxp_df_level == 2):
+            if (relative_delta_e > 1e-3) and (mf.mxp_df_level == 2) and (curr_mxp_level == 2):
                 mf.mxp_df_dtype = 'float16'
-            elif (relative_delta_e > 1e-6) and (mf.mxp_df_level >= 1):
+            elif (relative_delta_e > 1e-6) and (mf.mxp_df_level >= 1) and (curr_mxp_level >= 1):
                 mf.mxp_df_dtype = 'float32'
+                curr_mxp_level = 1
             else:
                 mf.mxp_df_dtype = 'float64'
+                curr_mxp_level = 0
             logger.info(mf, 'cycle=%d, mxp_df_dtype set to %s', cycle+1, mf.mxp_df_dtype)
         vhf = mf.get_veff(mol, dm, dm_last, vhf)
         t1 = log.timer_debug1('veff', *t1)

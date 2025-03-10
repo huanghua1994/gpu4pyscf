@@ -192,18 +192,6 @@ class DF(lib.StreamObject):
         '''
         device_id = cupy.cuda.Device().id
         cderi_sparse = self._cderi[device_id]
-        if unpack and unpack_dtype == cupy.float32:
-            if self._cderi_f32 is None:
-                _num_devices = int(num_devices)
-                self._cderi_f32 = [self._cderi[i].astype(cupy.float32) for i in range(_num_devices)]
-            cderi_sparse_cast = self._cderi_f32[device_id]
-        if unpack and unpack_dtype == cupy.float16:
-            if self._cderi_f16 is None:
-                _num_devices = int(num_devices)
-                self._cderi_f16 = [self._cderi[i].astype(cupy.float16) for i in range(_num_devices)]
-            cderi_sparse_cast = self._cderi_f16[device_id]
-        if unpack and unpack_dtype == cupy.float64:
-            cderi_sparse_cast = cderi_sparse
         if blksize is None:
             blksize = self.get_blksize()
         nao = self.nao
@@ -211,24 +199,20 @@ class DF(lib.StreamObject):
         rows = self.intopt.cderi_row
         cols = self.intopt.cderi_col
         buf_prefetch = None
-        buf_prefetch_cast = None
         buf_cderi = cupy.zeros([blksize,nao,nao], dtype=unpack_dtype)
         for p0, p1 in lib.prange(0, naux_slice, blksize):
             p2 = min(naux_slice, p1+blksize)
             if isinstance(cderi_sparse, cupy.ndarray):
                 buf = cderi_sparse[p0:p1,:]
-                buf_cast = cderi_sparse_cast[p0:p1,:]
             if isinstance(cderi_sparse, np.ndarray):
                 # first block
                 if buf_prefetch is None:
                     buf = cupy.asarray(cderi_sparse[p0:p1,:])
-                    buf_cast = cupy.asarray(cderi_sparse_cast[p0:p1,:])
                 buf_prefetch = cupy.empty([p2-p1,cderi_sparse.shape[1]])
-                buf_prefetch_cast = cupy.empty([p2-p1,cderi_sparse_cast.shape[1]])
             if isinstance(cderi_sparse, np.ndarray) and p1 < p2:
                 buf_prefetch.set(cderi_sparse[p1:p2,:])
-                buf_prefetch_cast.set(cderi_sparse_cast[p1:p2,:])
             if unpack:
+                buf_cast = buf.astype(unpack_dtype)
                 buf_cderi[:p1-p0,rows,cols] = buf_cast
                 buf_cderi[:p1-p0,cols,rows] = buf_cast
                 buf2 = buf_cderi[:p1-p0]
@@ -240,7 +224,6 @@ class DF(lib.StreamObject):
 
             if buf_prefetch is not None:
                 buf = buf_prefetch
-                buf_cast = buf_prefetch_cast
 
     def reset(self, mol=None):
         '''Reset mol and clean up relevant attributes for scanner mode'''
