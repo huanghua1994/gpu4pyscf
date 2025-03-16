@@ -59,6 +59,8 @@ class DF(lib.StreamObject):
         self._rsh_df = {}
         self._cderi_f32 = None
         self._cderi_f16 = None
+        self._cderi_scale_factors = {}
+        self._last_blksize = {}
 
     __getstate__, __setstate__ = lib.generate_pickle_methods(
         excludes=('cd_low', 'intopt', '_cderi', '_vjopt'))
@@ -186,6 +188,52 @@ class DF(lib.StreamObject):
         assert blksize > 0
         return blksize
 
+    def cderi_scale_factor(self, blksize=None, unpack=True, unpack_dtype=cupy.float64):
+        '''
+        loop over cderi for the current device and find the scale factor
+        by scale max to sqrt(fp16.max)
+        '''
+        device_id = cupy.cuda.Device().id
+        old_blksize = self._last_blksize.get(device_id, None)
+        # only recalc scale factor when blksize changed
+        if old_blksize is not None and old_blksize == blksize:
+            return self._cderi_scale_factors[device_id]
+        if self._cderi_scale_factors.get(device_id, None) is not None:
+            self._cderi_scale_factors[device_id] = None
+            self._last_blksize[device_id] = blksize
+        cderi_sparse = self._cderi[device_id]
+        if blksize is None:
+            blksize = self.get_blksize()
+        naux_slice = cderi_sparse.shape[0]
+        buf_prefetch = None
+        self._cderi_scale_factors[device_id] = cupy.ones([(naux_slice + blksize - 1) // blksize], dtype=cderi_sparse.dtype)
+        fp16_max = cupy.sqrt(cupy.finfo(cupy.float16).max).astype(cderi_sparse.dtype)
+        fp16_scale_max = cupy.sqrt(cupy.finfo(cupy.float16).max.astype(cderi_sparse.dtype) / cupy.finfo(cupy.float16).smallest_normal.astype(cderi_sparse.dtype))
+        for p0, p1 in lib.prange(0, naux_slice, blksize):
+            index = p0 // blksize
+            p2 = min(naux_slice, p1 + blksize)
+            if isinstance(cderi_sparse, cupy.ndarray):
+                buf = cderi_sparse[p0:p1,:]
+            if isinstance(cderi_sparse, np.ndarray):
+                # first block
+                if buf_prefetch is None:
+                    buf = cupy.asarray(cderi_sparse[p0:p1,:])
+                buf_prefetch = cupy.empty([p2-p1,cderi_sparse.shape[1]])
+            if isinstance(cderi_sparse, np.ndarray) and p1 < p2:
+                buf_prefetch.set(cderi_sparse[p1:p2,:])
+            if unpack:
+                if unpack_dtype == cupy.float16:
+                    abs_min = cupy.absolute(buf).min
+                    abs_max = cupy.absolute(buf).max
+                    if abs_min * fp16_scale_max < abs_max:
+                        self._cderi_scale_factors[index] = abs_max / fp16_max
+            if isinstance(cderi_sparse, np.ndarray):
+                cupy.cuda.Device().synchronize()
+
+            if buf_prefetch is not None:
+                buf = buf_prefetch
+        return self._cderi_scale_factors[device_id]
+
     def loop(self, blksize=None, unpack=True, unpack_dtype=cupy.float64):
         ''' loop over cderi for the current device
             and unpack the CDERI in (Lij) format
@@ -201,6 +249,7 @@ class DF(lib.StreamObject):
         buf_prefetch = None
         buf_cderi = cupy.zeros([blksize,nao,nao], dtype=unpack_dtype)
         for p0, p1 in lib.prange(0, naux_slice, blksize):
+            index = p0 // blksize
             p2 = min(naux_slice, p1+blksize)
             if isinstance(cderi_sparse, cupy.ndarray):
                 buf = cderi_sparse[p0:p1,:]
@@ -212,13 +261,17 @@ class DF(lib.StreamObject):
             if isinstance(cderi_sparse, np.ndarray) and p1 < p2:
                 buf_prefetch.set(cderi_sparse[p1:p2,:])
             if unpack:
-                buf_cast = buf.astype(unpack_dtype)
+                # only apply scale factor when in fp16 and it's not 1
+                if unpack_dtype == cupy.float16 and self._cderi_scale_factors[device_id][index] != 1.0:
+                    buf_cast = (buf / self._cderi_scale_factors[device_id][index]).astype(unpack_dtype)
+                else:
+                    buf_cast = buf.astype(unpack_dtype)
                 buf_cderi[:p1-p0,rows,cols] = buf_cast
                 buf_cderi[:p1-p0,cols,rows] = buf_cast
                 buf2 = buf_cderi[:p1-p0]
             else:
                 buf2 = None
-            yield buf2, buf.T
+            yield buf2, buf.T, index
             if isinstance(cderi_sparse, np.ndarray):
                 cupy.cuda.Device().synchronize()
 
