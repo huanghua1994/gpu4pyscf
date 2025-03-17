@@ -298,9 +298,7 @@ def _jk_task_with_mo(dfobj, dms, mo_coeff, mo_occ,
                 vj_packed = cupy.zeros_like(dm_sparse)
             if with_k and enable_mxp:
                 occ_coeff_mxp = [occ_coeff[i].astype(mxp_df_dtype) for i in range(nset)]
-            # calc scale factor before loop
-            cderi_scale_factors = dfobj.cderi_scale_factor(blksize=blksize, unpack=with_k)
-            for cderi, cderi_sparse, index in dfobj.loop(blksize=blksize, unpack=with_k):
+            for cderi, cderi_sparse in dfobj.loop(blksize=blksize, unpack=with_k, unpack_dtype=mxp_df_dtype):
                 # leading dimension is 1
                 if with_j:
                     rhoj = dm_sparse.dot(cderi_sparse)
@@ -310,14 +308,15 @@ def _jk_task_with_mo(dfobj, dms, mo_coeff, mo_occ,
                     for i in range(nset):
                         if enable_mxp:
                             cderi_mxp = cderi
-                            rhok_mxp = contract('Lij,jk->Lki', cderi_mxp, occ_coeff_mxp[i])
+                            curr_bs = cderi_mxp.shape[0]
+                            cderi_mxp.reshape([-1,nao])
+                            rhok_mxp = cupy.dot(cderi_mxp, occ_coeff_mxp[i])  # Lij,jk -> Lik
+                            nocc = occ_coeff_mxp[i].shape[1]
+                            rhok_mxp = rhok_mxp.reshape([curr_bs,nao,nocc])
+                            rhok_mxp = cupy.transpose(rhok_mxp, axes=(0,2,1))  # Lik -> Lki
                             rhok_mxp = rhok_mxp.reshape([-1,nao])
                             syrk_mxp = cupy.dot(rhok_mxp.T, rhok_mxp)
-                            # only apply scale factor when in fp16 and it's not 1
-                            if mxp_df_dtype == cupy.float16 and cderi_scale_factors[index] != 1.0:
-                                vk[i] += syrk_mxp.astype(vk[i].dtype) * (cderi_scale_factors[index] ** 2)
-                            else:
-                                vk[i] += syrk_mxp.astype(vk[i].dtype)
+                            vk[i] += syrk_mxp.astype(vk[i].dtype)
                             rhok_mxp = None
                             syrk_mxp = None
                         else:
