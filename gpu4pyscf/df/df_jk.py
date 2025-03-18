@@ -297,8 +297,10 @@ def _jk_task_with_mo(dfobj, dms, mo_coeff, mo_occ,
             if with_j:
                 vj_packed = cupy.zeros_like(dm_sparse)
             if with_k and enable_mxp:
+                if mxp_df_dtype == cupy.float16:
+                    dfobj.cderi_calc_scale_factor(blksize)
                 occ_coeff_mxp = [occ_coeff[i].astype(mxp_df_dtype) for i in range(nset)]
-            for cderi, cderi_sparse in dfobj.loop(blksize=blksize, unpack=with_k, unpack_dtype=mxp_df_dtype):
+            for cderi, cderi_sparse, cderi_scale_inv2 in dfobj.loop(blksize=blksize, unpack=with_k, unpack_dtype=mxp_df_dtype):
                 # leading dimension is 1
                 if with_j:
                     rhoj = dm_sparse.dot(cderi_sparse)
@@ -316,7 +318,10 @@ def _jk_task_with_mo(dfobj, dms, mo_coeff, mo_occ,
                             rhok_mxp = cupy.transpose(rhok_mxp, axes=(0,2,1))  # Lik -> Lki
                             rhok_mxp = rhok_mxp.reshape([-1,nao])
                             syrk_mxp = cupy.dot(rhok_mxp.T, rhok_mxp)
-                            vk[i] += syrk_mxp.astype(vk[i].dtype)
+                            if (cderi_scale_inv2 != 1):
+                                vk[i] += syrk_mxp.astype(vk[i].dtype) * cderi_scale_inv2
+                            else:
+                                vk[i] += syrk_mxp.astype(vk[i].dtype)
                             rhok_mxp = None
                             syrk_mxp = None
                         else:
