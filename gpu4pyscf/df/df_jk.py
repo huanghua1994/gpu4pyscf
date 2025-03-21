@@ -308,14 +308,14 @@ def _jk_task_with_mo(dfobj, dms, mo_coeff, mo_occ,
                 cderi_sparse = rhoj = None
                 if with_k:
                     for i in range(nset):
+                        curr_bs = cderi.shape[0]
+                        nocc = occ_coeff[i].shape[1]
                         if enable_mxp:
                             cderi_mxp = cderi
-                            curr_bs = cderi_mxp.shape[0]
                             cderi_mxp.reshape([-1,nao])
-                            rhok_mxp = cupy.dot(cderi_mxp, occ_coeff_mxp[i])  # Lij,jk -> Lik
-                            nocc = occ_coeff_mxp[i].shape[1]
+                            rhok_mxp = cupy.dot(cderi_mxp, occ_coeff_mxp[i])    # Lij,jk -> Lik
                             rhok_mxp = rhok_mxp.reshape([curr_bs,nao,nocc])
-                            rhok_mxp = cupy.transpose(rhok_mxp, axes=(0,2,1))  # Lik -> Lki
+                            rhok_mxp = cupy.transpose(rhok_mxp, axes=(0,2,1))   # Lik -> Lki
                             rhok_mxp = rhok_mxp.reshape([-1,nao])
                             syrk_mxp = cupy.dot(rhok_mxp.T, rhok_mxp)
                             if (cderi_scale_inv2 != 1):
@@ -325,9 +325,10 @@ def _jk_task_with_mo(dfobj, dms, mo_coeff, mo_occ,
                             rhok_mxp = None
                             syrk_mxp = None
                         else:
-                            rhok = contract('Lji,jk->Lki', cderi, occ_coeff[i])
-                            # In most cases, syrk does not outperform cupy.dot
-                            #cublas.syrk('T', rhok.reshape([-1,nao]), out=vk[i], alpha=1.0, beta=1.0, lower=True)
+                            cderi.reshape([-1,nao])
+                            rhok = cupy.dot(cderi, occ_coeff[i])        # Lij,jk -> Lik
+                            rhok = rhok.reshape([curr_bs,nao,nocc])
+                            rhok = cupy.transpose(rhok, axes=(0,2,1))   # Lik -> Lki
                             rhok = rhok.reshape([-1,nao])
                             vk[i] += cupy.dot(rhok.T, rhok)
                     rhok = None

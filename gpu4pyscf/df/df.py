@@ -178,8 +178,8 @@ class DF(lib.StreamObject):
         '''
         if nao is None: nao = self.nao
         mem_avail = get_avail_mem()
-        blksize = int(mem_avail*0.2/8/(nao*nao + extra) / ALIGNED) * ALIGNED
-        blksize = min(blksize, MIN_BLK_SIZE)
+        blksize = int(mem_avail*0.5/8/(nao*nao + extra) / ALIGNED) * ALIGNED
+        #blksize = min(blksize, MIN_BLK_SIZE)
         log = logger.new_logger(self.mol, self.mol.verbose)
         device_id = cupy.cuda.Device().id
         log.debug(f"{mem_avail/1e9:.3f} GB memory available on Device {device_id}, block size = {blksize}")
@@ -308,7 +308,7 @@ def cholesky_eri_gpu(intopt, mol, auxmol, cd_low,
         # CDERI will be equally distributed to the devices
         # Other devices usually have more memory available than Device 0
         # CDERI will use up to 40% of the available memory
-        use_gpu_memory = naux * npairs * 8 < 0.4 * avail_mem * num_devices
+        use_gpu_memory = naux * npairs * 8 < 0.8 * avail_mem * num_devices
 
     if use_gpu_memory:
         log.debug("Saving CDERI on GPU")
