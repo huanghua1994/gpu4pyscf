@@ -1,0 +1,22 @@
+diff --git a/gpu4pyscf/df/df.py b/gpu4pyscf/df/df.py
+index d7dbe74..1f833e4 100644
+--- a/gpu4pyscf/df/df.py
++++ b/gpu4pyscf/df/df.py
+@@ -254,6 +254,7 @@ class DF(lib.StreamObject):
+             if isinstance(cderi_sparse, np.ndarray) and p1 < p2:
+                 buf_prefetch.set(cderi_sparse[p1:p2,:])
+             if unpack:
++                """
+                 if (unpack_dtype == cupy.float16):
+                     scale = self._cderi_scale[device_id][index].astype(unpack_dtype)
+                     scale_inv2 = 1.0 / (scale * scale)
+@@ -261,6 +262,9 @@ class DF(lib.StreamObject):
+                 else:
+                     scale_inv2 = 1.0
+                     buf_cast = buf
++                """
++                scale_inv2 = 1.0
++                buf_cast = buf
+                 buf_cderi[:p1-p0,rows,cols] = buf_cast
+                 buf_cderi[:p1-p0,cols,rows] = buf_cast
+                 buf2 = buf_cderi[:p1-p0]

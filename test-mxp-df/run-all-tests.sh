@@ -7,7 +7,7 @@ declare -a xyz_files
 declare -a basis_set=("6-311gss" "def2-tzvpp")
 declare -a calc_types=("DFT")
 declare -a mxp_df_levels=(0 1 2)
-max_cycle=30
+max_cycle=50
 conv_tol=1e-9
 run_verbose=5
 xc="b3lyp"

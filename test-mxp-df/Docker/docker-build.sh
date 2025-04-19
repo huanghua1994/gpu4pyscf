@@ -1,3 +1,5 @@
+#!/bin/bash
+
 BASE_IMAGE=nvidia/cuda:12.8.0-devel-ubuntu24.04
 IMAGE_TAG=ubuntu24.04-gcc13.1-cuda12.8-PySCF-GPU-MxP-DF
 

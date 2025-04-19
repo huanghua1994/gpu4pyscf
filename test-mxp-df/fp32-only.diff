@@ -1,0 +1,22 @@
+diff --git a/gpu4pyscf/scf/hf.py b/gpu4pyscf/scf/hf.py
+index 6b08c27..a343430 100644
+--- a/gpu4pyscf/scf/hf.py
++++ b/gpu4pyscf/scf/hf.py
+@@ -220,6 +220,7 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
+         dm = mf.make_rdm1(mo_coeff, mo_occ)
+         t1 = log.timer_debug1('dm', *t1)
+         if hasattr(mf, 'mxp_df_level'):
++            """
+             relative_delta_e = abs(last_delta_e) / abs(last_hf_e)
+             if (relative_delta_e > 1e-3) and (mf.mxp_df_level == 2) and (curr_mxp_level == 2) and (fp16_iters < max_fp16_iter):
+                 mf.mxp_df_dtype = 'float16'
+@@ -232,6 +233,9 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
+                 mf.mxp_df_dtype = 'float64'
+                 fp64_iters += 1
+                 curr_mxp_level = 0
++            """
++            mf.mxp_df_dtype = 'float32'
++            fp32_iters += 1
+             logger.info(mf, 'cycle=%d, mxp_df_dtype set to %s', cycle+1, mf.mxp_df_dtype)
+         vhf = mf.get_veff(mol, dm, dm_last, vhf)
+         t1 = log.timer_debug1('veff', *t1)
