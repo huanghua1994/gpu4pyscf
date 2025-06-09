@@ -28,6 +28,7 @@ from gpu4pyscf.dft import rks, uks, numint
 from gpu4pyscf.scf import hf, uhf
 from gpu4pyscf.df import df, int3c2e
 from gpu4pyscf.__config__ import _streams, num_devices
+from gpu4pyscf.lib.mxp_df_helper import use_cuda_jk_build, cuda_jk_build
 
 def _pin_memory(array):
     mem = cupy.cuda.alloc_pinned_memory(array.nbytes)
@@ -129,7 +130,7 @@ class _DFHF:
                 vk = super().get_jk(mol, dm, hermi, False, True, omega)[1]
         elif self.with_df:
             vj, vk = self.with_df.get_jk(dm, hermi, with_j, with_k,
-                                         self.direct_scf_tol, omega)
+                                         self.direct_scf_tol, omega, self.mxp_df_level)
         else:
             vj, vk = super().get_jk(mol, dm, hermi, with_j, with_k, omega)
         return vj, vk
@@ -276,7 +277,7 @@ class _DFHF:
         return utils.to_cpu(self, obj)
 
 def _jk_task_with_mo(dfobj, dms, mo_coeff, mo_occ,
-                     with_j=True, with_k=True, hermi=0, device_id=0):
+                     with_j=True, with_k=True, hermi=0, device_id=0, mxp_df_level=0):
     ''' Calculate J and K matrices on single GPU
     '''
     with cupy.cuda.Device(device_id), _streams[device_id]:
@@ -314,6 +315,28 @@ def _jk_task_with_mo(dfobj, dms, mo_coeff, mo_occ,
                 occ_coeff[i] = mo_coeff[i][:,occ_idx] * mo_occ[i][occ_idx]**0.5
                 nocc += int(mo_occ[i].sum())
             blksize = dfobj.get_blksize(extra=nao*nocc)
+
+            if use_cuda_jk_build():
+                vj_packed = cupy.zeros_like(dm_sparse) if with_j else None
+                vk = cupy.zeros_like(dms) if with_k else None
+                for i in range(nset):
+                    device_id = cupy.cuda.Device().id
+                    cderi_sparse = dfobj._cderi[device_id]
+                    nocc = occ_coeff[0].shape[1]
+                    naux = cderi_sparse.shape[0]
+                    cuda_jk_build(
+                        naux, nao, nocc, mxp_df_level,
+                        0, dfobj.intopt.cderi_row, dfobj.intopt.cderi_col,
+                        cderi_sparse, occ_coeff[i], dm_sparse, with_j, with_k,
+                        vj_packed, vk[i], blksize
+                    )
+                if with_j:
+                    vj = cupy.zeros(dms_shape)
+                    vj[:,rows,cols] = vj_packed
+                    vj[:,cols,rows] = vj_packed
+                t0 = log.timer_debug1(f'vj and vk on Device {device_id}', *t0)
+                return vj, vk
+
             if with_j:
                 vj_packed = cupy.zeros_like(dm_sparse)
             for cderi, cderi_sparse in dfobj.loop(blksize=blksize, unpack=with_k):
@@ -402,7 +425,7 @@ def _jk_task_with_mo1(dfobj, dms, mo1s, occ_coeffs,
         t0 = log.timer_debug1(f'vj and vk on Device {device_id}', *t0)
     return vj, vk
 
-def _jk_task_with_dm(dfobj, dms, with_j=True, with_k=True, hermi=0, device_id=0):
+def _jk_task_with_dm(dfobj, dms, with_j=True, with_k=True, hermi=0, device_id=0, mxp_df_level=0):
     ''' Calculate J and K matrices with density matrix
     '''
     with cupy.cuda.Device(device_id), _streams[device_id]:
@@ -430,6 +453,26 @@ def _jk_task_with_dm(dfobj, dms, with_j=True, with_k=True, hermi=0, device_id=0)
 
         nset = dms.shape[0]
         blksize = dfobj.get_blksize()
+
+        if use_cuda_jk_build():
+            for i in range(nset):
+                device_id = cupy.cuda.Device().id
+                cderi_sparse = dfobj._cderi[device_id]
+                nocc = nao
+                naux = cderi_sparse.shape[0]
+                cuda_jk_build(
+                    naux, nao, nocc, mxp_df_level,
+                    1, dfobj.intopt.cderi_row, dfobj.intopt.cderi_col,
+                    cderi_sparse, dms[i], dm_sparse, with_j, with_k,
+                    vj_sparse, vk[i], blksize
+                )
+            if with_j:
+                vj = cupy.zeros(dms_shape)
+                vj[:,rows,cols] = vj_sparse
+                vj[:,cols,rows] = vj_sparse
+            t0 = log.timer_debug1(f'vj and vk on Device {device_id}', *t0)
+            return vj, vk
+
         for cderi, cderi_sparse in dfobj.loop(blksize=blksize, unpack=with_k):
             if with_j:
                 rhoj = dm_sparse.dot(cderi_sparse)
@@ -447,7 +490,7 @@ def _jk_task_with_dm(dfobj, dms, with_j=True, with_k=True, hermi=0, device_id=0)
         t0 = log.timer_debug1(f'vj and vk on Device {device_id}', *t0)
     return vj, vk
 
-def get_jk(dfobj, dms_tag, hermi=0, with_j=True, with_k=True, direct_scf_tol=1e-14, omega=None):
+def get_jk(dfobj, dms_tag, hermi=0, with_j=True, with_k=True, direct_scf_tol=1e-14, omega=None, mxp_df_level=0):
     '''
     get jk with density fitting
     outputs and input are on the same device
@@ -493,7 +536,7 @@ def get_jk(dfobj, dms_tag, hermi=0, with_j=True, with_k=True, direct_scf_tol=1e-
                     _jk_task_with_mo,
                     dfobj, dms, mo_coeff, mo_occ,
                     hermi=hermi, device_id=device_id,
-                    with_j=with_j, with_k=with_k)
+                    with_j=with_j, with_k=with_k, mxp_df_level=mxp_df_level)
                 futures.append(future)
 
     elif hasattr(dms_tag, 'mo1'):
@@ -527,7 +570,7 @@ def get_jk(dfobj, dms_tag, hermi=0, with_j=True, with_k=True, direct_scf_tol=1e-
                 future = executor.submit(
                     _jk_task_with_dm, dfobj, dms,
                     hermi=hermi, device_id=device_id,
-                    with_j=with_j, with_k=with_k)
+                    with_j=with_j, with_k=with_k, mxp_df_level=mxp_df_level)
                 futures.append(future)
 
     vj = vk = None
