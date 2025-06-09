@@ -29,6 +29,7 @@ from gpu4pyscf.lib.cupy_helper import (
     block_diag, sandwich_dot)
 from gpu4pyscf.scf import diis, jk, j_engine
 from gpu4pyscf.lib import logger
+from gpu4pyscf.lib.mxp_df_helper import use_cuda_jk_build
 
 __all__ = [
     'get_jk', 'get_occ', 'get_grad', 'damping', 'level_shift', 'get_fock',
@@ -204,12 +205,26 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
     s1e = cupy.asarray(mf.get_ovlp(mol))
     t1 = log.timer_debug1('hcore', *t1)
 
+    use_cuda_jk_build_ = use_cuda_jk_build()
+    if hasattr(mf, 'mxp_df_level'):
+        if mf.mxp_df_level < 0 or mf.mxp_df_level > 4:
+            logger.warn(mf, "Invalide mxp_df_level value %d, set to 0", mf.mxp_df_level)
+            mf.mxp_df_level = 0
+    else:
+        mf.mxp_df_level = 0
+    if not use_cuda_jk_build_:
+        mf.mxp_df_level = 0
+
     dm, dm0 = asarray(dm0, order='C'), None
     vhf = mf.get_veff(mol, dm)
     e_tot = mf.energy_tot(dm, h1e, vhf)
     log.info('init E= %.15g', e_tot)
     t1 = log.timer_debug1('total prep', *t0)
     scf_conv = False
+
+    last_delta_e = e_tot
+    mxp_df_level_cnt = [0, 0, 0, 0, 0]
+    mxp_df_level_cnt[mf.mxp_df_level] += 1
 
     # Skip SCF iterations. Compute only the total energy of the initial density
     if mf.max_cycle <= 0:
@@ -246,6 +261,25 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
         fock = None
         t1 = log.timer_debug1('eig', *t1)
 
+        rel_delta_e = abs(last_delta_e) / abs(last_hf_e)
+        # Disable switch from lower level (higher accuracy) to higher level (lower accuracy)
+        # TODO: need to tune
+        if mf.mxp_df_level == 4 and rel_delta_e > 2e-6:
+            mf.mxp_df_level = 4
+        elif mf.mxp_df_level >= 3 and rel_delta_e > 4e-9:
+            mf.mxp_df_level = 3
+        elif mf.mxp_df_level >= 2 and rel_delta_e > 2e-11:
+            mf.mxp_df_level = 2
+        elif mf.mxp_df_level >= 1 and rel_delta_e > 7e-14:
+            mf.mxp_df_level = 1
+        else:
+            mf.mxp_df_level = 0
+        if not use_cuda_jk_build_:
+            mf.mxp_df_level = 0
+        mxp_df_level_cnt[mf.mxp_df_level] += 1
+        log.info("\n*****\nMxP DF info: cycle %d, rel_delta_e = %.3g, mxp_df_level = %d\n*****\n",
+                 cycle+1, rel_delta_e, mf.mxp_df_level)
+
         mo_occ = mf.get_occ(mo_energy, mo_coeff)
         dm = mf.make_rdm1(mo_coeff, mo_occ)
         vhf = mf.get_veff(mol, dm, dm_last, vhf)
@@ -260,6 +294,7 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
         t1 = log.timer_debug1('total', *t0)
         log.info('cycle= %d E= %.15g  delta_E= %4.3g  |g|= %4.3g  |ddm|= %4.3g',
                  cycle+1, e_tot, e_tot-last_hf_e, norm_gorb, norm_ddm)
+        last_delta_e = e_tot - last_hf_e
 
         if dump_chk:
             mf.dump_chk(locals())
@@ -270,6 +305,8 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
             break
     else:
         log.warn("SCF failed to converge")
+
+    log.info(f"MxP DF level 0, 1, 2, 3, 4 iters: {mxp_df_level_cnt}")
 
     return scf_conv, e_tot, mo_energy, mo_coeff, mo_occ
 

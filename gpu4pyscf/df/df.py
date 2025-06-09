@@ -131,9 +131,9 @@ class DF(lib.StreamObject):
 
     def get_jk(self, dm, hermi=1, with_j=True, with_k=True,
                direct_scf_tol=getattr(__config__, 'scf_hf_SCF_direct_scf_tol', 1e-13),
-               omega=None):
+               omega=None, mxp_df_level=0):
         if omega is None:
-            return df_jk.get_jk(self, dm, hermi, with_j, with_k, direct_scf_tol)
+            return df_jk.get_jk(self, dm, hermi, with_j, with_k, direct_scf_tol, mxp_df_level=mxp_df_level)
         assert omega >= 0.0
 
         # A temporary treatment for RSH-DF integrals
@@ -232,8 +232,8 @@ def cholesky_eri_gpu(intopt, mol, auxmol, cd_low,
     if use_gpu_memory:
         # CDERI will be equally distributed to the devices
         # Other devices usually have more memory available than Device 0
-        # CDERI will use up to 40% of the available memory
-        use_gpu_memory = naux * npairs * 8 < 0.4 * avail_mem * num_devices
+        # CDERI will use up to 80% of the available memory
+        use_gpu_memory = naux * npairs * 8 < 0.8 * avail_mem * num_devices
 
     if use_gpu_memory:
         log.debug("Saving CDERI on GPU")

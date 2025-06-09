@@ -140,6 +140,11 @@ if(BUILD_CUPY_HELPER)
   add_subdirectory(cupy_helper)
 endif()
 
+option(BUILD_MXP_DF_HELPER "Using mxp_df_helper" ON)
+if(BUILD_MXP_DF_HELPER)
+  add_subdirectory(mxp_df_helper)
+endif()
+
 option(BUILD_SOLVENT "Using SMD solvent" ON)
 if(BUILD_SOLVENT)
   add_subdirectory(solvent)
