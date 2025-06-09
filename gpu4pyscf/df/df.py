@@ -28,6 +28,11 @@ from gpu4pyscf.df import int3c2e_bdiv
 from gpu4pyscf.lib import logger
 from gpu4pyscf import __config__
 from gpu4pyscf.__config__ import _streams, num_devices
+from gpu4pyscf.mxp_df_helper.helper import (
+    OzakiSchemeHelper,
+    mxp_df_level_to_split_dtype,
+    get_gemm_padding,
+)
 
 MIN_BLK_SIZE = getattr(__config__, 'min_ao_blksize', 128)
 ALIGNED = getattr(__config__, 'ao_aligned', 32)
@@ -131,9 +136,9 @@ class DF(lib.StreamObject):
 
     def get_jk(self, dm, hermi=1, with_j=True, with_k=True,
                direct_scf_tol=getattr(__config__, 'scf_hf_SCF_direct_scf_tol', 1e-13),
-               omega=None):
+               omega=None, mxp_df_level=0):
         if omega is None:
-            return df_jk.get_jk(self, dm, hermi, with_j, with_k, direct_scf_tol)
+            return df_jk.get_jk(self, dm, hermi, with_j, with_k, direct_scf_tol, mxp_df_level=mxp_df_level)
         assert omega >= 0.0
 
         # A temporary treatment for RSH-DF integrals
@@ -160,7 +165,7 @@ class DF(lib.StreamObject):
         assert blksize > 0
         return blksize
 
-    def loop(self, blksize=None, unpack=True):
+    def loop(self, blksize=None, unpack=True, mxp_df_level=0):
         ''' loop over cderi for the current device
             and unpack the CDERI in (Lij) format
         '''
@@ -173,7 +178,8 @@ class DF(lib.StreamObject):
         rows = self.intopt.cderi_row
         cols = self.intopt.cderi_col
         buf_prefetch = None
-        buf_cderi = cupy.zeros([blksize,nao,nao])
+        padded_nao = get_gemm_padding(nao)
+        buf_cderi = cupy.zeros([blksize, padded_nao, padded_nao])
         for p0, p1 in lib.prange(0, naux_slice, blksize):
             p2 = min(naux_slice, p1+blksize)
             if isinstance(cderi_sparse, cupy.ndarray):
@@ -186,9 +192,21 @@ class DF(lib.StreamObject):
             if isinstance(cderi_sparse, np.ndarray) and p1 < p2:
                 buf_prefetch.set(cderi_sparse[p1:p2,:])
             if unpack:
-                buf_cderi[:p1-p0,rows,cols] = buf
-                buf_cderi[:p1-p0,cols,rows] = buf
-                buf2 = buf_cderi[:p1-p0]
+                num_split, split_dtype = mxp_df_level_to_split_dtype(mxp_df_level)
+                if split_dtype == cupy.float64:
+                    buf_cderi[:p1-p0, rows, cols] = buf
+                    buf_cderi[:p1-p0, cols, rows] = buf
+                    buf2 = buf_cderi[:p1-p0]
+                else:
+                    cderi_sparse_buf = buf
+                    cderi_sparse_os = OzakiSchemeHelper(cupy.float64)
+                    cderi_sparse_os.split(num_split, split_dtype, cderi_sparse_buf)
+                    cderi_dense_split_tensors = [cupy.zeros([blksize, padded_nao, padded_nao], dtype=split_dtype) for _ in range(num_split)]
+                    for i in range(num_split):
+                        cderi_dense_split_tensors[i][:p1-p0, rows, cols] = cderi_sparse_os.split_tensors[i]
+                        cderi_dense_split_tensors[i][:p1-p0, cols, rows] = cderi_sparse_os.split_tensors[i]
+                    cderi_dense_os = OzakiSchemeHelper(cupy.float64, num_split, split_dtype, cderi_dense_split_tensors)
+                    buf2 = cderi_dense_os
             else:
                 buf2 = None
             yield buf2, buf.T
@@ -231,8 +249,8 @@ def cholesky_eri_gpu(intopt, mol, auxmol, cd_low,
     if use_gpu_memory:
         # CDERI will be equally distributed to the devices
         # Other devices usually have more memory available than Device 0
-        # CDERI will use up to 40% of the available memory
-        use_gpu_memory = naux * npairs * 8 < 0.4 * avail_mem * num_devices
+        # CDERI will use up to 80% of the available memory
+        use_gpu_memory = naux * npairs * 8 < 0.8 * avail_mem * num_devices
 
     if use_gpu_memory:
         log.debug("Saving CDERI on GPU")
