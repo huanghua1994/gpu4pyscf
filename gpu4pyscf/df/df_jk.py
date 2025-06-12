@@ -226,6 +226,7 @@ class _DFHF:
         obj = self.undo_df().to_cpu().density_fit()
         return utils.to_cpu(self, obj)
 
+from gpu4pyscf.lib.mxp_df_helper import mxp_df_helper
 def _jk_task_with_mo(dfobj, dms, mo_coeff, mo_occ,
                      with_j=True, with_k=True, hermi=0, device_id=0, mxp_df_level=0):
     ''' Calculate J and K matrices on single GPU
