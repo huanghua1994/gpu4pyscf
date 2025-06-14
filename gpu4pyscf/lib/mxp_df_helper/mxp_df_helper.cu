@@ -119,6 +119,9 @@ static int cderi_nnz = 0;
 static int *cderi_rows_d = nullptr;
 static int *cderi_cols_d = nullptr;
 
+static double f64_one = 1, f64_zero = 0;
+static float  f32_one = 1, f32_zero = 0;
+
 static cublasHandle_t cublas_handle = nullptr;
 static cublasLtHandle_t lt_handle = nullptr;
 static void *cublas_workspace = nullptr;
@@ -187,152 +190,194 @@ inline static void print_matrix(float *mat, int ldm, int nrow, int ncol, const c
     printf("\n");
 }
 
+inline static void dump_binary(const char *filename, const void *data, size_t size)
+{
+    FILE *fp = fopen(filename, "wb");
+    if (!fp) {
+        perror("Failed to open file");
+        return;
+    }
+
+    size_t written = fwrite(data, 1, size, fp);
+    if (written != size) {
+        fprintf(stderr, "fwrite failed: wrote %zu of %zu bytes\n", written, size);
+    }
+
+    fclose(fp);
+    printf("Dumped binary data to %s (%zu bytes)\n", filename, written);
+}
+
+#define DF_K_BUILD_SUBTASK_COMMON \
+    if (cublas_handle == nullptr) \
+    { \
+        CUBLAS_CHECK( cublasCreate(&cublas_handle) ); \
+        CUBLAS_CHECK( cublasLtCreate(&lt_handle) ); \
+        CUDA_CHECK( cudaMalloc((void**) &cublas_workspace, cublas_workspace_bytes) ); \
+    } \
+    CUBLAS_CHECK( cublasSetStream(cublas_handle, stream) ); \
+    cublasComputeType_t compute_type; \
+    cudaDataType_t AB_type, C_type, scale_type; \
+    get_cublas_gemm_dtypes<SplitType>(compute_type, AB_type, C_type, scale_type); \
+
+
 template<int num_split, typename SplitType>
-void DF_K_build_subtask(
-    cudaStream_t stream, const int use_Dmat, const int init_padded_K_k,
-    const int naux_blk, const int nao, const int padded_nao, const int padded_nocc,
-    SplitType *cderi_i, SplitType *C_or_D_j, SplitType *rho_K_k, SplitType *padded_K_k
+void DF_K_build_subtask1(
+    cudaStream_t stream, const int use_Dmat, const int init_output,
+    const int i, const int j,
+    const int naux_blk, const int padded_nao, const int padded_nocc,
+    SplitType *cderi_i, SplitType *C_or_D_j, SplitType *rho_K_k
 )
 {
-    if (cublas_handle == nullptr)
-    {
-        CUBLAS_CHECK( cublasCreate(&cublas_handle) );
-        CUBLAS_CHECK( cublasLtCreate(&lt_handle) );
-        CUDA_CHECK( cudaMalloc((void**) &cublas_workspace, cublas_workspace_bytes) );
-    }
-    CUBLAS_CHECK( cublasSetStream(cublas_handle, stream) );
+    DF_K_BUILD_SUBTASK_COMMON;
 
-    cublasComputeType_t compute_type;
-    cudaDataType_t AB_type, C_type, scale_type;
-    get_cublas_gemm_dtypes<SplitType>(compute_type, AB_type, C_type, scale_type);
-
-    double f64_one = 1, f64_zero = 0;
-    float  f32_one = 1, f32_zero = 0;
+    char fname_prefix[256];
+    sprintf(fname_prefix, "i%d_j%d_k%d", i, j, i+j);
 
     // Step 1: einsum Lij,jk -> Lki. 
     // For each L, ij,jk -> ki is doing C^T = B^T * A^T. Since the input cderi and C/D are in
     // row-major and cuBLAS takes column-major, A^T, B^T, C^T in row-major == A, B, C in
     // column-major. We do a strided batched GEMM for C = B * A in column-major.
+    int m = use_Dmat ? padded_nao : padded_nocc;
+    int n = padded_nao;
+    int k = padded_nao;
+    void *alpha = nullptr, *beta = nullptr;
+    if constexpr (std::is_same_v<SplitType, double>)
     {
-        int m = use_Dmat ? padded_nao : padded_nocc;
-        int n = padded_nao;
-        int k = padded_nao;
-        void *alpha = nullptr, *beta = nullptr;
-        if constexpr (std::is_same_v<SplitType, double>)
-        {
-            alpha = static_cast<void *>(&f64_one);
-            beta = static_cast<void *>(&f64_zero);
-        } else {
-            alpha = static_cast<void *>(&f32_one);
-            beta = static_cast<void *>(&f32_zero);
-        }
-        const void *A = static_cast<const void*>(C_or_D_j);
-        const void *B = static_cast<const void*>(cderi_i);
-        void *C = static_cast<void*>(rho_K_k);
-        cublasOperation_t transA = CUBLAS_OP_N;
-        cublasOperation_t transB = CUBLAS_OP_N;
-        int lda = m;
-        int ldb = k;
-        int ldc = n;
-        long long int stride_A = 0;
-        long long int stride_B = static_cast<long long int>(k * n);
-        long long int stride_C = static_cast<long long int>(m * n);
-        int batch_count = naux_blk;
-        cublasGemmAlgo_t algo = CUBLAS_GEMM_DEFAULT;
-
-        auto A_arr = get_dev_f16_to_host_fp32(A, 5 * padded_nocc, 0);
-        auto B_arr = get_dev_f16_to_host_fp32(B, 5 * padded_nao, 0);
-        auto C_arr_before = get_dev_f16_to_host_fp32(C, 5 * padded_nao, 0);
-        printf("[DEBUG] Lij,jk -> Lki:\n");
-        print_matrix(A_arr.data(), padded_nocc, 5, 5, "lhs (original rhs, C or D) [0:5, 0:5]");
-        print_matrix(B_arr.data(), padded_nao, 5, 5, "rhs (cderi_i) [0:5, 0:5]");
-        print_matrix(C_arr_before.data(), padded_nao, 5, 5, "C before [0:5, 0:5]");
-
-        CUBLAS_CHECK( cublasGemmStridedBatchedEx(
-            cublas_handle, transA, transB, m, n, k,
-            alpha,
-            A, AB_type, lda, stride_A,
-            B, AB_type, ldb, stride_B,
-            beta,
-            C, C_type, ldc, stride_C,
-            batch_count, compute_type, algo
-        ) );
-
-        auto C_arr_after = get_dev_f16_to_host_fp32(C, 5 * padded_nao, 0);
-        print_matrix(C_arr_after.data(), padded_nao, 5, 5, "C after [0:5, 0:5]");
+        alpha = static_cast<void *>(&f64_one);
+        beta = init_output ? static_cast<void *>(&f64_zero) : alpha;
+    } else {
+        alpha = static_cast<void *>(&f32_one);
+        beta = init_output ? static_cast<void *>(&f32_zero) : alpha;
     }
+    const void *A = static_cast<const void*>(C_or_D_j);
+    const void *B = static_cast<const void*>(cderi_i);
+    void *C = static_cast<void*>(rho_K_k);
+    cublasOperation_t transA = CUBLAS_OP_N;
+    cublasOperation_t transB = CUBLAS_OP_N;
+    int lda = m;
+    int ldb = k;
+    int ldc = m;
+    long long int stride_A = 0;
+    long long int stride_B = static_cast<long long int>(k * n);
+    long long int stride_C = static_cast<long long int>(m * n);
+    int batch_count = naux_blk;
+    cublasGemmAlgo_t algo = CUBLAS_GEMM_DEFAULT;
+
+    auto A_arr = get_dev_f16_to_host_fp32(A, /*padded_nao * padded_nocc*/ 5 * padded_nocc, 0);
+    auto B_arr = get_dev_f16_to_host_fp32(B, /*naux_blk * padded_nao * padded_nao*/ 5 * padded_nao, 0);
+    auto C_arr_before = get_dev_f16_to_host_fp32(C, /*naux_blk * padded_nocc * padded_nao */ 5 * padded_nao, 0);
+    //print_matrix(A_arr.data(), padded_nocc, 5, 5, "lhs (original rhs, C or D) [0:5, 0:5]");
+    //print_matrix(B_arr.data(), padded_nao, 5, 5, "rhs (cderi_i) [0:5, 0:5]");
+    //print_matrix(C_arr_before.data(), padded_nao, 5, 5, "C before [0:5, 0:5]");
+
+    CUBLAS_CHECK( cublasGemmStridedBatchedEx(
+        cublas_handle, transA, transB, m, n, k,
+        alpha,
+        A, AB_type, lda, stride_A,
+        B, AB_type, ldb, stride_B,
+        beta,
+        C, C_type, ldc, stride_C,
+        batch_count, compute_type, algo
+    ) );
+
+    auto C_arr_after = get_dev_f16_to_host_fp32(C, naux_blk * padded_nocc * padded_nao, 0);
+    print_matrix(C_arr_after.data(), padded_nao, 5, 5, "C after [0:5, 0:5]");
+    /*
+    dump_binary(
+        (std::string(fname_prefix) + "_rhok_out.bin").c_str(),
+        C_arr_after.data(), 4 * naux_blk * padded_nao * padded_nocc
+    );
+    */
+}
+
+template<int num_split, typename SplitType>
+void DF_K_build_subtask2(
+    cudaStream_t stream, const int use_Dmat, const int init_output,
+    const int i, const int j,
+    const int naux_blk, const int padded_nao, const int padded_nocc,
+    SplitType *cderi_or_rho_K_i, SplitType *rho_K_j, SplitType *padded_K_k
+)
+{
+    DF_K_BUILD_SUBTASK_COMMON;
+
+    char fname_prefix[256];
+    sprintf(fname_prefix, "i%d_j%d_k%d", i, j, i+j);
 
     // Step 2: einsum Lki,Lkj -> ij.
     // This is actually computing K = C^T * C, and since C is in row-major, C^T == C in 
     // column-major. K is symmetric, does not matter if it is in row-major or column-major.
+    int m = padded_nao;
+    int n = padded_nao;
+    int k = naux_blk * (use_Dmat ? padded_nao : padded_nocc);
+    void *alpha = nullptr, *beta = nullptr;
+    if constexpr (std::is_same_v<SplitType, double>)
     {
-        int m = padded_nao;
-        int n = padded_nao;
-        int k = naux_blk * (use_Dmat ? padded_nao : padded_nocc);
-        void *alpha = nullptr, *beta = nullptr;
-        if constexpr (std::is_same_v<SplitType, double>)
-        {
-            alpha = static_cast<void *>(&f64_one);
-            beta = init_padded_K_k ? static_cast<void *>(&f64_zero) : alpha;
-        } else {
-            alpha = static_cast<void *>(&f32_one);
-            beta = init_padded_K_k ? static_cast<void *>(&f32_zero) : alpha;
-        }
-        const void *A = use_Dmat ? static_cast<const void*>(cderi_i) 
-                                 : static_cast<const void*>(rho_K_k);
-        const void *B = static_cast<const void*>(rho_K_k);
-        void *C = static_cast<void*>(padded_K_k);
-        cublasOperation_t transA = CUBLAS_OP_N;
-        cublasOperation_t transB = CUBLAS_OP_T;
-        int lda = m;
-        int ldb = n;
-        int ldc = m;
-        cublasLtMatmulDesc_t matmul_desc = nullptr;
-        cublasLtMatrixLayout_t Adesc = nullptr, Bdesc = nullptr, Cdesc = nullptr;
-        cublasLtMatmulPreference_t preference = NULL;
-        cublasLtMatmulHeuristicResult_t heur_result = {};
-        int return_result = 0;
-        CUBLAS_CHECK( cublasLtMatmulDescCreate(&matmul_desc, compute_type, scale_type) );
-        CUBLAS_CHECK( cublasLtMatmulDescSetAttribute(matmul_desc, CUBLASLT_MATMUL_DESC_TRANSA, &transA, sizeof(transA)) );
-        CUBLAS_CHECK( cublasLtMatmulDescSetAttribute(matmul_desc, CUBLASLT_MATMUL_DESC_TRANSB, &transB, sizeof(transB)) );
-        CUBLAS_CHECK( cublasLtMatrixLayoutCreate(&Adesc, AB_type, m, k, lda) );
-        CUBLAS_CHECK( cublasLtMatrixLayoutCreate(&Bdesc, AB_type, n, k, ldb) );
-        CUBLAS_CHECK( cublasLtMatrixLayoutCreate(&Cdesc, C_type, m, n, ldc));
-        CUBLAS_CHECK( cublasLtMatmulPreferenceCreate(&preference) );
-        CUBLAS_CHECK( cublasLtMatmulPreferenceSetAttribute(
-            preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &cublas_workspace_bytes, sizeof(cublas_workspace_bytes)
-        ) );
-        CUBLAS_CHECK( cublasLtMatmulAlgoGetHeuristic(
-            lt_handle, matmul_desc, Adesc, Bdesc, Cdesc, Cdesc, preference, 1, &heur_result, &return_result
-        ) );
-        if (return_result == 0) CUBLAS_CHECK(CUBLAS_STATUS_NOT_SUPPORTED);
-
-        auto A_arr = get_dev_f16_to_host_fp32(A, 5 * padded_nao, 0);
-        auto B_arr = get_dev_f16_to_host_fp32(B, 5 * padded_nao, 0);
-        auto C_arr_before = get_dev_f16_to_host_fp32(C, 5 * padded_nao, 0);
-        printf("[DEBUG] Lki,Lkj -> ij:\n");
-        print_matrix(A_arr.data(), padded_nao, 5, 5, "lhs (rho_k) [0:5, 0:5]");
-        print_matrix(B_arr.data(), padded_nao, 5, 5, "rhs (rho_k) [0:5, 0:5]");
-        print_matrix(C_arr_before.data(), padded_nao, 5, 5, "C before [0:5, 0:5]");
-
-        #if 0
-        CUBLAS_CHECK( cublasLtMatmul(
-            lt_handle, matmul_desc, alpha, A, Adesc, B, Bdesc,
-            beta, C, Cdesc, C, Cdesc, &heur_result.algo, 
-            cublas_workspace, cublas_workspace_bytes, stream
-        ) );
-        #else
-        CUBLAS_CHECK( cublasGemmEx(
-            cublas_handle, transA, transB, m, n, k,
-            alpha, A, AB_type, lda, B, AB_type, ldb,
-            beta, C, C_type, ldc,
-            compute_type, CUBLAS_GEMM_DEFAULT
-        ) );
-        #endif
-
-        auto C_arr_after = get_dev_f16_to_host_fp32(C, 5 * padded_nao, 0);
-        print_matrix(C_arr_after.data(), padded_nao, 5, 5, "C after [0:5, 0:5]");
+        alpha = static_cast<void *>(&f64_one);
+        beta = init_output ? static_cast<void *>(&f64_zero) : alpha;
+    } else {
+        alpha = static_cast<void *>(&f32_one);
+        beta = init_output ? static_cast<void *>(&f32_zero) : alpha;
     }
+    const void *A = static_cast<const void*>(cderi_or_rho_K_i);
+    const void *B = static_cast<const void*>(rho_K_j);
+    void *C = static_cast<void*>(padded_K_k);
+    cublasOperation_t transA = CUBLAS_OP_N;
+    cublasOperation_t transB = CUBLAS_OP_T;
+    int lda = m;
+    int ldb = n;
+    int ldc = m;
+    cublasLtMatmulDesc_t matmul_desc = nullptr;
+    cublasLtMatrixLayout_t Adesc = nullptr, Bdesc = nullptr, Cdesc = nullptr;
+    cublasLtMatmulPreference_t preference = NULL;
+    cublasLtMatmulHeuristicResult_t heur_result = {};
+    int return_result = 0;
+    CUBLAS_CHECK( cublasLtMatmulDescCreate(&matmul_desc, compute_type, scale_type) );
+    CUBLAS_CHECK( cublasLtMatmulDescSetAttribute(matmul_desc, CUBLASLT_MATMUL_DESC_TRANSA, &transA, sizeof(transA)) );
+    CUBLAS_CHECK( cublasLtMatmulDescSetAttribute(matmul_desc, CUBLASLT_MATMUL_DESC_TRANSB, &transB, sizeof(transB)) );
+    CUBLAS_CHECK( cublasLtMatrixLayoutCreate(&Adesc, AB_type, m, k, lda) );
+    CUBLAS_CHECK( cublasLtMatrixLayoutCreate(&Bdesc, AB_type, n, k, ldb) );
+    CUBLAS_CHECK( cublasLtMatrixLayoutCreate(&Cdesc, C_type, m, n, ldc));
+    CUBLAS_CHECK( cublasLtMatmulPreferenceCreate(&preference) );
+    CUBLAS_CHECK( cublasLtMatmulPreferenceSetAttribute(
+        preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &cublas_workspace_bytes, sizeof(cublas_workspace_bytes)
+    ) );
+    CUBLAS_CHECK( cublasLtMatmulAlgoGetHeuristic(
+        lt_handle, matmul_desc, Adesc, Bdesc, Cdesc, Cdesc, preference, 1, &heur_result, &return_result
+    ) );
+    if (return_result == 0) CUBLAS_CHECK(CUBLAS_STATUS_NOT_SUPPORTED);
+
+    auto A_arr = get_dev_f16_to_host_fp32(A, naux_blk * padded_nocc * padded_nao, 0);
+    auto B_arr = get_dev_f16_to_host_fp32(B, naux_blk * padded_nocc * padded_nao, 0);
+    auto C_arr_before = get_dev_f16_to_host_fp32(C, 5 * padded_nao, 0);
+    print_matrix(A_arr.data(), padded_nao, 5, 5, "lhs (rho_k_i) [0:5, 0:5]");
+    print_matrix(B_arr.data(), padded_nao, 5, 5, "rhs (rho_k_j) [0:5, 0:5]");
+    print_matrix(C_arr_before.data(), padded_nao, 5, 5, "C before [0:5, 0:5]");
+
+    printf("[DEBUG] m, n, k = %d, %d, %d\n", m, n, k);
+    printf("[DEBUG] lda, ldb, ldc = %d, %d, %d\n", lda, ldb, ldc);
+    
+    dump_binary(
+        (std::string(fname_prefix) + "_rhok_i.bin").c_str(),
+        (const void *) A_arr.data(), 4 * naux_blk * padded_nocc * padded_nao
+    );
+
+    #if 0
+    CUBLAS_CHECK( cublasLtMatmul(
+        lt_handle, matmul_desc, alpha, A, Adesc, B, Bdesc,
+        beta, C, Cdesc, C, Cdesc, &heur_result.algo, 
+        cublas_workspace, cublas_workspace_bytes, stream
+    ) );
+    #else
+    CUBLAS_CHECK( cublasGemmEx(
+        cublas_handle, transA, transB, m, n, k,
+        alpha, A, AB_type, lda, B, AB_type, ldb,
+        beta, C, C_type, ldc,
+        compute_type, CUBLAS_GEMM_DEFAULT
+    ) );
+    #endif
+
+    auto C_arr_after = get_dev_f16_to_host_fp32(C, 5 * padded_nao, 0);
+    print_matrix(C_arr_after.data(), padded_nao, 5, 5, "C after [0:5, 0:5]");
 }
 
 template<int num_split, typename OType, typename SplitType>
@@ -355,21 +400,42 @@ void DF_K_build_work(
     SplitType *cderi_splits[4] = {cderi_split_0, cderi_split_1, cderi_split_2, cderi_split_3};
     SplitType *C_or_D_splits[4] = {C_or_D_split_0, C_or_D_split_1, C_or_D_split_2, C_or_D_split_3};
 
+    printf("[DEBUG] ********** Lij,jk -> Lki **********\n");
     for (int i = 0; i < num_split; i++)
     {
+        int init_output = (i == 0);
         SplitType *cderi_i = cderi_splits[i];
-        int init_padded_K_k = (i == 0);
         for (int j = 0; j < num_split - i; j++)
         {
             const int k = i + j;
-            printf("[DEBUG] subtask: i=%d, j=%d, k=%d\n", i, j, k);
+            printf("[DEBUG] =====> subtask: i=%d, j=%d, k=%d <=====\n", i, j, k);
             SplitType *C_or_D_j = C_or_D_splits[j];
             SplitType *rho_K_k = rho_K_splits + k * rho_K_size;
+            DF_K_build_subtask1<num_split, SplitType>(
+                stream, use_Dmat, init_output, i, j,
+                naux_blk, padded_nao, padded_nocc,
+                cderi_i, C_or_D_j, rho_K_k
+            );
+        }
+    }
+
+    printf("[DEBUG] ********** Lki,Lkj -> ij **********\n");
+    for (int i = 0; i < num_split; i++)
+    {
+        SplitType *cderi_i = cderi_splits[i];
+        SplitType *rho_K_i = rho_K_splits + i * rho_K_size;
+        SplitType *cderi_or_rko_K_i = use_Dmat ? cderi_i : rho_K_i;
+        int init_output = (i == 0);
+        for (int j = 0; j < num_split - i; j++)
+        {
+            const int k = i + j;
+            printf("[DEBUG] =====> subtask: i=%d, j=%d, k=%d <=====\n", i, j, k);
+            SplitType *rho_K_j = rho_K_splits + j * rho_K_size;
             SplitType *padded_K_k = padded_K_splits + k * padded_K_size;
-            DF_K_build_subtask<num_split, SplitType>(
-                stream, use_Dmat, init_padded_K_k,
-                naux_blk, nao, padded_nao, padded_nocc,
-                cderi_i, C_or_D_j, rho_K_k, padded_K_k
+            DF_K_build_subtask2<num_split, SplitType>(
+                stream, use_Dmat, init_output, i, j,
+                naux_blk, padded_nao, padded_nocc,
+                cderi_or_rko_K_i, rho_K_j, padded_K_k
             );
         }
     }
