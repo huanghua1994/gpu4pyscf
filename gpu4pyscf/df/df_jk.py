@@ -33,6 +33,8 @@ from gpu4pyscf.mxp_df_helper.helper import (
     ozaki_scheme_gemm,
     get_gemm_padding,
 )
+import pdb
+from gpu4pyscf.lib.mxp_df_helper import DF_K_build
 
 def _pin_memory(array):
     mem = cupy.cuda.alloc_pinned_memory(array.nbytes)
@@ -226,7 +228,6 @@ class _DFHF:
         obj = self.undo_df().to_cpu().density_fit()
         return utils.to_cpu(self, obj)
 
-from gpu4pyscf.lib.mxp_df_helper import mxp_df_helper
 def _jk_task_with_mo(dfobj, dms, mo_coeff, mo_occ,
                      with_j=True, with_k=True, hermi=0, device_id=0, mxp_df_level=0):
     ''' Calculate J and K matrices on single GPU
@@ -294,6 +295,7 @@ def _jk_task_with_mo(dfobj, dms, mo_coeff, mo_occ,
                             cderi_os = cderi
                             # Except for the last split, curr_bs is always a multiplier of 128, no need to worry about
                             curr_bs = cderi_os.split_tensors[0].shape[0]
+                            #pdb.set_trace()
                             # Lij,jk -> Lik
                             cderi_os.reshape([-1, padded_nao])
                             rhok_os = ozaki_scheme_gemm(cderi_os, occ_coeff_os[i], num_split, 'NN')
@@ -304,6 +306,16 @@ def _jk_task_with_mo(dfobj, dms, mo_coeff, mo_occ,
                             # Lki,Lkj -> ij
                             vk_i_os = ozaki_scheme_gemm(rhok_os, rhok_os, num_split, 'TN')
                             vk_i = vk_i_os.upcast()
+                            vk[i] += vk_i[0:nao, 0:nao]
+                            """
+                            vk_i0 = cupy.copy(vk[i])
+                            DF_K_build(
+                                0, curr_bs, nao, padded_nao, padded_nocc,
+                                num_split, cderi_os.split_tensors, occ_coeff_os[i].split_tensors,
+                                vk_i0
+                            )
+                            pdb.set_trace()
+                            """
                         else:
                             curr_bs = cderi.shape[0]
                             cderi = cderi.reshape([-1, padded_nao])
@@ -313,7 +325,7 @@ def _jk_task_with_mo(dfobj, dms, mo_coeff, mo_occ,
                             rhok = cupy.transpose(rhok, axes=(0, 2, 1))     # Lik -> Lki
                             rhok = rhok.reshape([-1, padded_nao])
                             vk_i = cupy.dot(rhok.T, rhok)                   # Lki,Lkj -> ij
-                        vk[i] += vk_i[0:nao, 0:nao]
+                            vk[i] += vk_i[0:nao, 0:nao]
                     rhok = None
 
             if with_j:
