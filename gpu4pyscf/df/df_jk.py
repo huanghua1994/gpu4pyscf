@@ -228,6 +228,8 @@ class _DFHF:
         obj = self.undo_df().to_cpu().density_fit()
         return utils.to_cpu(self, obj)
 
+_use_cublas_gemm = True
+
 def _jk_task_with_mo(dfobj, dms, mo_coeff, mo_occ,
                      with_j=True, with_k=True, hermi=0, device_id=0, mxp_df_level=0):
     ''' Calculate J and K matrices on single GPU
@@ -296,28 +298,23 @@ def _jk_task_with_mo(dfobj, dms, mo_coeff, mo_occ,
                             # Except for the last split, curr_bs is always a multiplier of 128, no need to worry about
                             curr_bs = cderi_os.split_tensors[0].shape[0]
 
-                            vk_i0 = cupy.copy(vk[i])
-
-                            #pdb.set_trace()
-                            # Lij,jk -> Lik
-                            cderi_os.reshape([-1, padded_nao])
-                            rhok_os = ozaki_scheme_gemm(cderi_os, occ_coeff_os[i], num_split, 'NN')
-                            rhok_os.reshape([curr_bs, padded_nao, padded_nocc])
-                            # Lik -> Lki
-                            rhok_os.transpose((0, 2, 1))
-                            rhok_os.reshape([-1, padded_nao])
-                            # Lki,Lkj -> ij
-                            vk_i_os = ozaki_scheme_gemm(rhok_os, rhok_os, num_split, 'TN')
-                            vk_i = vk_i_os.upcast()
-                            vk[i] += vk_i[0:nao, 0:nao]
-                            
-                            """
-                            DF_K_build(
-                                0, curr_bs, nao, padded_nao, padded_nocc, num_split, 
-                                cderi_os.split_tensors, occ_coeff_os[i].split_tensors, vk_i0
-                            )
-                            pdb.set_trace()
-                            """
+                            if _use_cublas_gemm:
+                                DF_K_build(
+                                    0, curr_bs, nao, padded_nao, padded_nocc, num_split, 
+                                    cderi_os.split_tensors, occ_coeff_os[i].split_tensors, vk[i]
+                                )
+                            else:
+                                # Lij,jk -> Lik
+                                cderi_os.reshape([-1, padded_nao])
+                                rhok_os = ozaki_scheme_gemm(cderi_os, occ_coeff_os[i], num_split, 'NN')
+                                rhok_os.reshape([curr_bs, padded_nao, padded_nocc])
+                                # Lik -> Lki
+                                rhok_os.transpose((0, 2, 1))
+                                rhok_os.reshape([-1, padded_nao])
+                                # Lki,Lkj -> ij
+                                vk_i_os = ozaki_scheme_gemm(rhok_os, rhok_os, num_split, 'TN')
+                                vk_i = vk_i_os.upcast()
+                                vk[i] += vk_i[0:nao, 0:nao]
                         else:
                             curr_bs = cderi.shape[0]
                             cderi = cderi.reshape([-1, padded_nao])
@@ -451,16 +448,23 @@ def _jk_task_with_dm(dfobj, dms, with_j=True, with_k=True, hermi=0, device_id=0,
                         cderi_os = cderi
                         # Except for the last split, curr_bs is always a multiplier of 128, no need to worry about
                         curr_bs = cderi_os.split_tensors[0].shape[0]
-                        # Lij,jk -> Lik
-                        cderi_os.reshape([-1, padded_nao])
-                        rhok_os = ozaki_scheme_gemm(cderi_os, dms_os[i], num_split, 'NN')
-                        rhok_os.reshape([curr_bs, padded_nao, padded_nao])
-                        # Lik -> Lki
-                        rhok_os.transpose((0, 2, 1))
-                        rhok_os.reshape([-1, padded_nao])
-                        # Lki,Lkj -> ij
-                        vk_k_os = ozaki_scheme_gemm(rhok_os, cderi_os, num_split, 'TN')
-                        vk_k = vk_k_os.upcast()
+                        if _use_cublas_gemm:
+                            DF_K_build(
+                                1, curr_bs, nao, padded_nao, 0, num_split,
+                                cderi_os.split_tensors, dms_os[i].split_tensors, vk[k]
+                            )
+                        else:
+                            # Lij,jk -> Lik
+                            cderi_os.reshape([-1, padded_nao])
+                            rhok_os = ozaki_scheme_gemm(cderi_os, dms_os[i], num_split, 'NN')
+                            rhok_os.reshape([curr_bs, padded_nao, padded_nao])
+                            # Lik -> Lki
+                            rhok_os.transpose((0, 2, 1))
+                            rhok_os.reshape([-1, padded_nao])
+                            # Lki,Lkj -> ij
+                            vk_k_os = ozaki_scheme_gemm(rhok_os, cderi_os, num_split, 'TN')
+                            vk_k = vk_k_os.upcast()
+                            vk[k] += vk_k[0:nao, 0:nao]
                     else:
                         curr_bs = cderi.shape[0]
                         cderi = cderi.reshape([-1, padded_nao])
@@ -470,7 +474,7 @@ def _jk_task_with_dm(dfobj, dms, with_j=True, with_k=True, hermi=0, device_id=0,
                         rhok = cupy.transpose(rhok, axes=(0, 2, 1))     # Lik -> Lki
                         rhok = rhok.reshape([-1, padded_nao])
                         vk_k = cupy.dot(rhok.T, cderi)                  # Lki,Lkj -> ij
-                    vk[k] += vk_k[0:nao, 0:nao]
+                        vk[k] += vk_k[0:nao, 0:nao]
         if with_j:
             vj = cupy.zeros(dms_shape)
             vj[:,rows,cols] = vj_sparse
@@ -599,4 +603,4 @@ def get_j(dfobj, dm, hermi=1, direct_scf_tol=1e-13):
     vj = int3c2e.get_j_int3c2e_pass2(intopt, rhoj)
     return vj
 
-density_fit = _densit
+density_fit = _density_fit
