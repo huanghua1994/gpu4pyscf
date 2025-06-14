@@ -163,7 +163,7 @@ def ozaki_scheme_gemm(lhs: OzakiSchemeHelper, rhs: OzakiSchemeHelper, out_num_sp
                 out_split_tensors[k] += cupy.dot(lhs.split_tensors[i], rhs.split_tensors[j])
             elif trans_op == 'TN':
                 out_split_tensors[k] += cupy.dot(lhs.split_tensors[i].T, rhs.split_tensors[j])
-            #print(f"{lhs.split_tensors[i][0:5,0:5]=}")
-            #print(f"{rhs.split_tensors[j][0:5,0:5]=}")
-            #print(f"{out_split_tensors[k][0:5,0:5]=}")
+            #print(f"lhs=\n{lhs.split_tensors[i][0:5,0:5]}")
+            #print(f"rhs=\n{rhs.split_tensors[j][0:5,0:5]}")
+            #print(f"out=\n{out_split_tensors[k][0:5,0:5]}")
     return OzakiSchemeHelper(lhs.input_dtype, out_num_split, lhs.split_dtype, out_split_tensors)

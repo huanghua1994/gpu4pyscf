@@ -285,6 +285,9 @@ def _jk_task_with_mo(dfobj, dms, mo_coeff, mo_occ,
                             cderi_os = cderi
                             # Except for the last split, curr_bs is always a multiplier of 128, no need to worry about
                             curr_bs = cderi_os.split_tensors[0].shape[0]
+
+                            vk_i0 = cupy.copy(vk[i])
+
                             #pdb.set_trace()
                             # Lij,jk -> Lik
                             cderi_os.reshape([-1, padded_nao])
@@ -297,12 +300,11 @@ def _jk_task_with_mo(dfobj, dms, mo_coeff, mo_occ,
                             vk_i_os = ozaki_scheme_gemm(rhok_os, rhok_os, num_split, 'TN')
                             vk_i = vk_i_os.upcast()
                             vk[i] += vk_i[0:nao, 0:nao]
+                            
                             """
-                            vk_i0 = cupy.copy(vk[i])
                             DF_K_build(
-                                0, curr_bs, nao, padded_nao, padded_nocc,
-                                num_split, cderi_os.split_tensors, occ_coeff_os[i].split_tensors,
-                                vk_i0
+                                0, curr_bs, nao, padded_nao, padded_nocc, num_split, 
+                                cderi_os.split_tensors, occ_coeff_os[i].split_tensors, vk_i0
                             )
                             pdb.set_trace()
                             """
@@ -587,4 +589,4 @@ def get_j(dfobj, dm, hermi=1, direct_scf_tol=1e-13):
     vj = int3c2e.get_j_int3c2e_pass2(intopt, rhoj)
     return vj
 
-density_fit = _density_fit
+density_fit = _densit
