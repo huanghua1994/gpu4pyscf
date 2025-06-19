@@ -2,6 +2,7 @@
 #include <assert.h>
 #include <iostream>
 #include <vector>
+#include <type_traits>
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -16,7 +17,7 @@
         if (cudaSuccess != result)                                                  \
         {                                                                           \
             fprintf(stderr, "[%s:%d] CUDA failed, ", __FUNCTION__, __LINE__);       \
-            fprintf(stderr, "reason: %s", cudaGetErrorString(result));              \
+            fprintf(stderr, "reason: %s\n", cudaGetErrorString(result));            \
         }                                                                           \
         assert(cudaSuccess == result);                                              \
     } while (0)
@@ -48,74 +49,9 @@
     } while (0)
 
 
-template<int num_split, typename IType, typename OType>
-__global__ void unpack_sym_split_cderi_kernel(
-    const int nnz, const int* __restrict__ rows, const int* __restrict__ cols,
-    const int nrow, const IType* __restrict__ cderi_sparse,
-    OType* __restrict__ cderi_0, OType* __restrict__ cderi_1,
-    OType* __restrict__ cderi_2, OType* __restrict__ cderi_3
-)
-{
-    const int tid = threadIdx.x + threadIdx.y * blockDim.x;
-    const int bid = blockIdx.x;
-    const int thread_block_size = blockDim.x * blockDim.y;
-    const int mat_size = nrow * nrow;
-    for (int nnz_id = tid; nnz_id < nnz; nnz_id += thread_block_size)
-    {
-        if (nnz_id < nnz)
-        {
-            int row = rows[nnz_id];
-            int col = cols[nnz_id];
-            size_t input_idx = bid * nnz + nnz_id;
-            size_t output_idx0 = bid * mat_size + row * nrow + col;
-            size_t output_idx1 = bid * mat_size + col * nrow + row;
-            IType in_value = cderi_sparse[input_idx];
-            OType out_value0 = static_cast<OType>(in_value);
-            cderi_0[output_idx0] = out_value0;
-            cderi_0[output_idx1] = out_value0;
-            if constexpr(num_split == 1) continue;
-            in_value -= static_cast<IType>(out_value0);
-            OType out_value1 = static_cast<OType>(in_value);
-            cderi_1[output_idx0] = out_value1;
-            cderi_1[output_idx1] = out_value1;
-            if constexpr(num_split == 2) continue;
-            in_value -= static_cast<IType>(out_value1);
-            OType out_value2 = static_cast<OType>(in_value);
-            cderi_2[output_idx0] = out_value2;
-            cderi_2[output_idx1] = out_value2;
-            if constexpr(num_split == 3) continue;
-            in_value -= static_cast<IType>(out_value2);
-            OType out_value3 = static_cast<OType>(in_value);
-            cderi_3[output_idx0] = out_value3;
-            cderi_3[output_idx1] = out_value3;
-        }
-    }
-}
-
-
-template<int num_split, typename SplitType, typename OType>
-__global__ void sum_rho_K_splits_kernel(
-    const int nao, const int padded_nao, OType *mat_K,
-    SplitType* __restrict__ padded_K_0, SplitType* __restrict__ padded_K_1,
-    SplitType* __restrict__ padded_K_2, SplitType* __restrict__ padded_K_3
-)
-{
-    const int row = blockIdx.x * blockDim.x + threadIdx.x;
-    const int col = blockIdx.y * blockDim.y + threadIdx.y;
-    if (row < padded_nao && col < padded_nao)
-    {
-        int src_idx = row * padded_nao + col;
-        int dst_idx = row * nao + col;
-        OType K_val = mat_K[dst_idx];
-        K_val += static_cast<OType>(padded_K_0[src_idx]);
-        if constexpr(num_split >= 2) K_val += static_cast<OType>(padded_K_1[src_idx]);
-        if constexpr(num_split >= 3) K_val += static_cast<OType>(padded_K_2[src_idx]);
-        if constexpr(num_split >= 4) K_val += static_cast<OType>(padded_K_3[src_idx]);
-        mat_K[dst_idx] = K_val;
-    }
-}
-
-static int cderi_nnz = 0;
+static int cderi_npair = 0;
+static int *cderi_rows_h = nullptr;
+static int *cderi_cols_h = nullptr;
 static int *cderi_rows_d = nullptr;
 static int *cderi_cols_d = nullptr;
 
@@ -126,6 +62,136 @@ static cublasHandle_t cublas_handle = nullptr;
 static cublasLtHandle_t lt_handle = nullptr;
 static void *cublas_workspace = nullptr;
 static const size_t cublas_workspace_bytes = 32 * 1024 * 1024;
+
+#define GEMM_ALIGNMENT 32  // Tensor Core kernels prefer this alignment
+
+// =============== Kernel functions ===============
+
+template<int num_split, typename IType, typename SplitType>
+__global__ void split_C_or_D_mat_kernel(
+    const int nrow, const int padded_nrow, const int ncol, const int padded_ncol,
+    const IType* __restrict__ input,
+    SplitType* __restrict__ output_0, SplitType* __restrict__ output_1,
+    SplitType* __restrict__ output_2, SplitType* __restrict__ output_3
+)
+{
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    const int col = blockIdx.y * blockDim.y + threadIdx.y;
+    const int input_idx = row * ncol + col;
+    const int output_idx = row * padded_ncol + col;
+    IType in_value = (row < nrow && col < ncol) ?
+        input[input_idx] : static_cast<IType>(0);
+    SplitType out_value0 = static_cast<SplitType>(in_value);
+    output_0[output_idx] = out_value0;
+    in_value -= static_cast<IType>(out_value0);
+    if constexpr(num_split == 1) return;
+    SplitType out_value1 = static_cast<SplitType>(in_value);
+    output_1[output_idx] = out_value1;
+    in_value -= static_cast<IType>(out_value1);
+    if constexpr(num_split == 2) return;
+    SplitType out_value2 = static_cast<SplitType>(in_value);
+    output_2[output_idx] = out_value2;
+    in_value -= static_cast<IType>(out_value2);
+    if constexpr(num_split == 3) return;
+    SplitType out_value3 = static_cast<SplitType>(in_value);
+    output_3[output_idx] = out_value3;
+}
+
+template<int num_split, typename IType, typename SplitType>
+__global__ void unpack_sym_split_cderi_kernel(
+    const int npair, const int* __restrict__ rows, const int* __restrict__ cols,
+    const int nrow, const IType* __restrict__ cderi_sparse,
+    SplitType* __restrict__ cderi_0, SplitType* __restrict__ cderi_1,
+    SplitType* __restrict__ cderi_2, SplitType* __restrict__ cderi_3
+)
+{
+    const int tid = threadIdx.x + threadIdx.y * blockDim.x;
+    const int bid = blockIdx.x;
+    const int thread_block_size = blockDim.x * blockDim.y;
+    const int mat_size = nrow * nrow;
+    for (int pair_id = tid; pair_id < npair; pair_id += thread_block_size)
+    {
+        if (pair_id > npair) continue;
+        int row = rows[pair_id];
+        int col = cols[pair_id];
+        size_t input_idx = bid * npair + pair_id;
+        size_t output_idx0 = bid * mat_size + row * nrow + col;
+        size_t output_idx1 = bid * mat_size + col * nrow + row;
+        IType in_value = cderi_sparse[input_idx];
+        SplitType out_value0 = static_cast<SplitType>(in_value);
+        cderi_0[output_idx0] = out_value0;
+        cderi_0[output_idx1] = out_value0;
+        if constexpr(num_split == 1) continue;
+        in_value -= static_cast<IType>(out_value0);
+        SplitType out_value1 = static_cast<SplitType>(in_value);
+        cderi_1[output_idx0] = out_value1;
+        cderi_1[output_idx1] = out_value1;
+        if constexpr(num_split == 2) continue;
+        in_value -= static_cast<IType>(out_value1);
+        SplitType out_value2 = static_cast<SplitType>(in_value);
+        cderi_2[output_idx0] = out_value2;
+        cderi_2[output_idx1] = out_value2;
+        if constexpr(num_split == 3) continue;
+        in_value -= static_cast<IType>(out_value2);
+        SplitType out_value3 = static_cast<SplitType>(in_value);
+        cderi_3[output_idx0] = out_value3;
+        cderi_3[output_idx1] = out_value3;
+    }
+}
+
+
+template<int num_split, typename SplitType, typename OutType>
+__global__ void sum_rho_K_splits_kernel(
+    const int nao, const int padded_nao, OutType *mat_K,
+    SplitType* __restrict__ padded_K_0, SplitType* __restrict__ padded_K_1,
+    SplitType* __restrict__ padded_K_2, SplitType* __restrict__ padded_K_3
+)
+{
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    const int col = blockIdx.y * blockDim.y + threadIdx.y;
+    if (row < nao && col < nao)
+    {
+        int src_idx = row * padded_nao + col;
+        int dst_idx = row * nao + col;
+        OutType K_val = mat_K[dst_idx];
+        K_val += static_cast<OutType>(padded_K_0[src_idx]);
+        if constexpr(num_split >= 2) K_val += static_cast<OutType>(padded_K_1[src_idx]);
+        if constexpr(num_split >= 3) K_val += static_cast<OutType>(padded_K_2[src_idx]);
+        if constexpr(num_split >= 4) K_val += static_cast<OutType>(padded_K_3[src_idx]);
+        mat_K[dst_idx] = K_val;
+    }
+}
+
+
+// =============== Helper functions ===============
+
+#define DF_K_BUILD_SUBTASK_COMMON \
+    if (cublas_handle == nullptr) \
+    { \
+        CUBLAS_CHECK( cublasCreate(&cublas_handle) ); \
+        CUBLAS_CHECK( cublasLtCreate(&lt_handle) ); \
+        CUDA_CHECK( cudaMalloc((void**) &cublas_workspace, cublas_workspace_bytes) ); \
+    } \
+    CUBLAS_CHECK( cublasSetStream(cublas_handle, stream) ); \
+    cublasComputeType_t compute_type; \
+    cudaDataType_t AB_type, C_type, scale_type; \
+    get_cublas_gemm_dtypes<SplitType>(compute_type, AB_type, C_type, scale_type);
+
+
+#define SPLIT_POINTERS(base_ptr, size) \
+    SplitType *base_ptr##_0 = base_ptr; \
+    SplitType *base_ptr##_1 = num_split > 1 ? base_ptr + size : nullptr; \
+    SplitType *base_ptr##_2 = num_split > 2 ? base_ptr + size * 2 : nullptr; \
+    SplitType *base_ptr##_3 = num_split > 3 ? base_ptr + size * 3 : nullptr;
+
+
+template<typename T>
+static T pad_size_for_gemm(const T n, const T alignment = GEMM_ALIGNMENT)
+{
+    assert(std::is_integral<T>::value);
+    return ((n + alignment - 1) / alignment) * alignment;
+}
+
 
 template<typename DType>
 void get_cublas_gemm_dtypes(
@@ -157,69 +223,100 @@ void get_cublas_gemm_dtypes(
     }
 }
 
-/*
-inline static std::vector<float> get_dev_f16_to_host_fp32(const void *dptr, size_t nelem, bool is_bfloat16)
-{
-    const size_t n = nelem * 2;
-    char *hptr = (char *) malloc(n);
-    cudaMemcpy((void *) hptr, dptr, n, cudaMemcpyDeviceToHost);
-    std::vector<float> floats;
-    if (is_bfloat16) {
-        __nv_bfloat16* h16p = reinterpret_cast<__nv_bfloat16*>(hptr);
-        for (size_t i = 0; i < nelem; i++)
-            floats.push_back(__bfloat162float(h16p[i]));
-    } else {
-        __half* h16p = reinterpret_cast<__half*>(hptr);
-        for (size_t i = 0; i < nelem; i++)
-            floats.push_back(__half2float(h16p[i]));
-    }
-    free(hptr);
-    return floats;
-};
 
-inline static void print_matrix(float *mat, int ldm, int nrow, int ncol, const char *name)
+// =============== Work functions with type template parameters ===============
+
+void DF_J_build_work(
+    cudaStream_t stream, const int naux_blk, const int npair, const int init_output,
+    const double *cderi_sparse, const double *D_mat_sparse, double *J_mat_sparse
+)
 {
-    printf("Matrix %s:\n", name);
-    for (int i = 0; i < nrow; ++i)
+    double *rho_j = nullptr;
+    CUDA_CHECK( cudaMalloc((void **) &rho_j, sizeof(double) * naux_blk) );
+
+    if (cublas_handle == nullptr)
     {
-        for (int j = 0; j < ncol; ++j)
-        {
-            printf("% 8.4e ", mat[i * ldm + j]);
-        }
-        printf("\n");
+        CUBLAS_CHECK( cublasCreate(&cublas_handle) );
+        CUBLAS_CHECK( cublasLtCreate(&lt_handle) );
+        CUDA_CHECK( cudaMalloc((void**) &cublas_workspace, cublas_workspace_bytes) );
     }
-    printf("\n");
+    CUBLAS_CHECK( cublasSetStream(cublas_handle, stream) );
+
+    // Step 1: GEMV: cderi_sparse [naux_blk, npair] * D_mat_sparse [npair] -> rho_j [naux_blk]
+    cublasOperation_t trans = CUBLAS_OP_T;
+    int m = npair, n = naux_blk;  // Swap parameters to match cuBLAS's column-major order
+    int ldA = npair, incx = 1, incy = 1;
+    const double *A = cderi_sparse;
+    const double *x = D_mat_sparse;
+    double *y = rho_j;
+    double *alpha = &f64_one;
+    double *beta = &f64_zero;
+    CUBLAS_CHECK( cublasDgemv(
+        cublas_handle, trans, m, n, alpha,
+        A, ldA, x, incx, beta, y, incy
+    ) );
+
+    // Step 2: GEMV: cderi_sparse^T [npair, naux_blk] * rho_j [naux_blk] -> J_mat_sparse [npair]
+    trans = CUBLAS_OP_N;
+    x = rho_j;
+    y = J_mat_sparse;
+    beta = init_output ? &f64_zero : &f64_one;
+    CUBLAS_CHECK( cublasDgemv(
+        cublas_handle, trans, m, n, alpha,
+        A, ldA, x, incx, beta, y, incy
+    ) );
+
+    CUDA_CHECK( cudaFree(rho_j) );
 }
 
-inline static void dump_binary(const char *filename, const void *data, size_t size)
+
+template<typename SplitType>
+void unpack_sym_split_cderi_work(
+    cudaStream_t stream, const int npair, const int *rows, const int *cols,
+    const int naux_blk, const int nrow, const double *cderi_sparse,
+    const int num_split, SplitType *cderi_splits, const size_t cderi_split_size
+)
 {
-    FILE *fp = fopen(filename, "wb");
-    if (!fp) {
-        perror("Failed to open file");
-        return;
+    ERROR_CHECK(num_split >= 1 && num_split <= 4, "num_split must be between 1 and 4.");
+
+    if (npair != cderi_npair)
+    {
+        free(cderi_rows_h);
+        free(cderi_cols_h);
+        CUDA_CHECK( cudaFree(cderi_rows_d) );
+        CUDA_CHECK( cudaFree(cderi_cols_d) );
+        cderi_npair = npair;
+        size_t rc_bytes = sizeof(int) * npair;
+        cderi_rows_h = (int *) malloc(rc_bytes);
+        cderi_cols_h = (int *) malloc(rc_bytes);
+        CUDA_CHECK( cudaMalloc((void**) &cderi_rows_d, rc_bytes) );
+        CUDA_CHECK( cudaMalloc((void**) &cderi_cols_d, rc_bytes) );
+        memcpy(cderi_rows_h, rows, rc_bytes);
+        memcpy(cderi_cols_h, cols, rc_bytes);
+        CUDA_CHECK( cudaMemcpyAsync(cderi_rows_d, rows, rc_bytes, cudaMemcpyHostToDevice, stream) );
+        CUDA_CHECK( cudaMemcpyAsync(cderi_cols_d, cols, rc_bytes, cudaMemcpyHostToDevice, stream) );
     }
 
-    size_t written = fwrite(data, 1, size, fp);
-    if (written != size) {
-        fprintf(stderr, "fwrite failed: wrote %zu of %zu bytes\n", written, size);
-    }
-
-    fclose(fp);
-    printf("Dumped binary data to %s (%zu bytes)\n", filename, written);
+    SPLIT_POINTERS(cderi_splits, cderi_split_size);
+    dim3 block(32, 32), grid(naux_blk);
+    #define DISPATCH_UNPACK_SYM_SPLIT_CDERI(itype, OutType, num_split) \
+    do { \
+        unpack_sym_split_cderi_kernel<num_split, itype, OutType><<<grid, block, 0, stream>>>( \
+            npair, cderi_rows_d, cderi_cols_d, nrow, \
+            static_cast<const itype*>(cderi_sparse), \
+            static_cast<OutType*>(cderi_splits_0), \
+            static_cast<OutType*>(cderi_splits_1), \
+            static_cast<OutType*>(cderi_splits_2), \
+            static_cast<OutType*>(cderi_splits_3) \
+        ); \
+    } while (0)
+    if (num_split == 1) DISPATCH_UNPACK_SYM_SPLIT_CDERI(double, SplitType, 1);
+    if (num_split == 2) DISPATCH_UNPACK_SYM_SPLIT_CDERI(double, SplitType, 2);
+    if (num_split == 3) DISPATCH_UNPACK_SYM_SPLIT_CDERI(double, SplitType, 3);
+    if (num_split == 4) DISPATCH_UNPACK_SYM_SPLIT_CDERI(double, SplitType, 4);
+    CUDA_CHECK(cudaGetLastError());
+    #undef DISPATCH_UNPACK_SYM_SPLIT_CDERI
 }
-*/
-
-#define DF_K_BUILD_SUBTASK_COMMON \
-    if (cublas_handle == nullptr) \
-    { \
-        CUBLAS_CHECK( cublasCreate(&cublas_handle) ); \
-        CUBLAS_CHECK( cublasLtCreate(&lt_handle) ); \
-        CUDA_CHECK( cudaMalloc((void**) &cublas_workspace, cublas_workspace_bytes) ); \
-    } \
-    CUBLAS_CHECK( cublasSetStream(cublas_handle, stream) ); \
-    cublasComputeType_t compute_type; \
-    cudaDataType_t AB_type, C_type, scale_type; \
-    get_cublas_gemm_dtypes<SplitType>(compute_type, AB_type, C_type, scale_type); \
 
 
 template<int num_split, typename SplitType>
@@ -232,11 +329,11 @@ void DF_K_build_subtask1(
 {
     DF_K_BUILD_SUBTASK_COMMON;
 
-    // Step 1: einsum Lij,jk -> Lki. 
+    // Step 1: einsum Lij,jk -> Lki.
     // For each L, ij,jk -> ki is doing C^T = B^T * A^T. Since the input cderi and C/D are in
     // row-major and cuBLAS takes column-major, use m == the original m, lda = the original k,
-    // transA = T, n == the original n, ldb = n, transB = T. 
-    int m = padded_nao; 
+    // transA = T, n == the original n, ldb = n, transB = T.
+    int m = padded_nao;
     int n = use_Dmat ? padded_nao : padded_nocc;
     int k = padded_nao;
     void *alpha = nullptr, *beta = nullptr;
@@ -273,6 +370,7 @@ void DF_K_build_subtask1(
     ) );
 }
 
+
 template<int num_split, typename SplitType>
 void DF_K_build_subtask2(
     cudaStream_t stream, const int use_Dmat, const int init_output,
@@ -284,7 +382,7 @@ void DF_K_build_subtask2(
     DF_K_BUILD_SUBTASK_COMMON;
 
     // Step 2: einsum Lki,Lkj -> ij.
-    // This is actually computing K = C^T * C, and since C is in row-major, C^T == C in 
+    // This is actually computing K = C^T * C, and since C is in row-major, C^T == C in
     // column-major. K is symmetric, does not matter if it is in row-major or column-major.
     int m = padded_nao;
     int n = padded_nao;
@@ -329,7 +427,7 @@ void DF_K_build_subtask2(
     #if 1
     CUBLAS_CHECK( cublasLtMatmul(
         lt_handle, matmul_desc, alpha, A, Adesc, B, Bdesc,
-        beta, C, Cdesc, C, Cdesc, &heur_result.algo, 
+        beta, C, Cdesc, C, Cdesc, &heur_result.algo,
         cublas_workspace, cublas_workspace_bytes, stream
     ) );
     #else
@@ -342,36 +440,26 @@ void DF_K_build_subtask2(
     #endif
 }
 
-template<int num_split, typename OType, typename SplitType>
+
+template<int num_split, typename OutType, typename SplitType>
 void DF_K_build_work(
-    cudaStream_t stream, const int use_Dmat,
-    const int naux_blk, const int nao, const int padded_nao, const int padded_nocc,
-    SplitType *cderi_split_0, SplitType *cderi_split_1,
-    SplitType *cderi_split_2, SplitType *cderi_split_3,
-    SplitType *C_or_D_split_0, SplitType *C_or_D_split_1,
-    SplitType *C_or_D_split_2, SplitType *C_or_D_split_3, 
-    OType *mat_K
+    cudaStream_t stream, const int use_Dmat, const int naux_blk,
+    const int nao, const int padded_nao, const int padded_nocc,
+    SplitType *cderi_splits, const size_t cderi_split_size,
+    SplitType *C_or_D_splits, const size_t C_or_D_split_size,
+    SplitType *rho_K_splits, const size_t rho_K_size,
+    SplitType *padded_K_splits, const size_t padded_K_size,
+    OutType *mat_K
 )
 {
-    SplitType *rho_K_splits = nullptr, *padded_K_splits = nullptr;
-    size_t rho_K_size = naux_blk * padded_nao * (use_Dmat ? padded_nao : padded_nocc);
-    size_t padded_K_size = naux_blk * padded_nao * padded_nao;
-    CUDA_CHECK( cudaMalloc((void **) &rho_K_splits, sizeof(SplitType) * num_split * rho_K_size) );
-    CUDA_CHECK( cudaMalloc((void **) &padded_K_splits, sizeof(SplitType) * num_split * padded_K_size) );
-
-    SplitType *cderi_splits[4] = {cderi_split_0, cderi_split_1, cderi_split_2, cderi_split_3};
-    SplitType *C_or_D_splits[4] = {C_or_D_split_0, C_or_D_split_1, C_or_D_split_2, C_or_D_split_3};
-
-    //printf("[DEBUG] ********** Lij,jk -> Lki **********\n");
     for (int i = 0; i < num_split; i++)
     {
         int init_output = (i == 0);
-        SplitType *cderi_i = cderi_splits[i];
+        SplitType *cderi_i = cderi_splits + i * cderi_split_size;
         for (int j = 0; j < num_split - i; j++)
         {
             const int k = i + j;
-            //printf("[DEBUG] =====> subtask: i=%d, j=%d, k=%d <=====\n", i, j, k);
-            SplitType *C_or_D_j = C_or_D_splits[j];
+            SplitType *C_or_D_j = C_or_D_splits + j * C_or_D_split_size;
             SplitType *rho_K_k = rho_K_splits + k * rho_K_size;
             DF_K_build_subtask1<num_split, SplitType>(
                 stream, use_Dmat, init_output, i, j,
@@ -383,7 +471,7 @@ void DF_K_build_work(
 
     for (int i = 0; i < num_split; i++)
     {
-        SplitType *cderi_i = cderi_splits[i];
+        SplitType *cderi_i = cderi_splits + i * cderi_split_size;
         SplitType *rho_K_i = rho_K_splits + i * rho_K_size;
         SplitType *cderi_or_rko_K_i = use_Dmat ? cderi_i : rho_K_i;
         int init_output = (i == 0);
@@ -400,157 +488,157 @@ void DF_K_build_work(
         }
     }
 
-    SplitType *padded_K_0 = padded_K_splits;
-    SplitType *padded_K_1 = num_split > 1 ? padded_K_splits + padded_K_size : nullptr;
-    SplitType *padded_K_2 = num_split > 2 ? padded_K_splits + padded_K_size * 2 : nullptr;
-    SplitType *padded_K_3 = num_split > 3 ? padded_K_splits + padded_K_size * 3 : nullptr;
-    dim3 block(16, 16);
+    SPLIT_POINTERS(padded_K_splits, padded_K_size);
+    dim3 block(32, 32);
     dim3 grid((nao + block.x - 1) / block.x, (nao + block.y - 1) / block.y);
     sum_rho_K_splits_kernel<num_split, SplitType><<<grid, block, 0, stream>>>(
-        nao, padded_nao, mat_K,
-        padded_K_0, padded_K_1, padded_K_2, padded_K_3
+        nao, padded_nao, mat_K, padded_K_splits_0, padded_K_splits_1,
+        padded_K_splits_2, padded_K_splits_3
     );
     CUDA_CHECK( cudaGetLastError() );
-    CUDA_CHECK( cudaStreamSynchronize(stream) );
+}
 
-    CUDA_CHECK( cudaFree(rho_K_splits));
-    CUDA_CHECK( cudaFree(padded_K_splits));
+
+template<typename SplitType>
+void DF_JK_build_work(
+    cudaStream_t stream, const int naux, const int nao, const int nocc, const int num_split,
+    const int use_Dmat, const int npair, const int *rows, const int *cols,
+    const double *cderi_sparse, const double *C_or_D_mat, const double *D_mat_sparse,
+    const int build_J, const int build_K, double *J_mat_sparse, double *K_mat,
+    const size_t avail_mem_bytes
+)
+{
+    if (build_J)
+        DF_J_build_work(stream, naux, npair, 1, cderi_sparse, D_mat_sparse, J_mat_sparse);
+
+    if (!build_K) return;
+    int padded_nao = pad_size_for_gemm(nao);
+    int padded_nocc = pad_size_for_gemm(nocc);
+    int C_or_D_ncol = use_Dmat ? nao : nocc;
+    int padded_C_or_D_ncol = use_Dmat ? padded_nao : padded_nocc;
+    size_t padded_C_or_D_size = padded_nao * padded_C_or_D_ncol;
+    size_t max_naux_blk = (avail_mem_bytes * 4 / 5 - sizeof(SplitType) * num_split * padded_C_or_D_size);
+    max_naux_blk /= (sizeof(SplitType) * num_split * padded_nao * padded_nao * 3);
+    max_naux_blk = pad_size_for_gemm(max_naux_blk);
+    if (max_naux_blk > 1024) max_naux_blk = 1024;
+    if (max_naux_blk < GEMM_ALIGNMENT)
+    {
+        fprintf(
+            stderr, "[ERROR][%s:%d] For DF JK build, calculate block size %d < threshold %d\n",
+            __FUNCTION__, __LINE__, max_naux_blk, GEMM_ALIGNMENT
+        );
+        return;
+    }
+    size_t padded_cderi_size = max_naux_blk * padded_nao * padded_nao;
+    size_t rho_K_size = max_naux_blk * padded_nao * padded_C_or_D_ncol;
+    size_t padded_K_size = max_naux_blk * padded_nao * padded_nao;
+    size_t C_or_D_splits_bytes = sizeof(SplitType) * num_split * padded_C_or_D_size;
+    size_t cderi_splits_bytes = sizeof(SplitType) * num_split * padded_cderi_size;
+    size_t rho_K_splits_bytes = sizeof(SplitType) * num_split * rho_K_size;
+    size_t padded_K_splits_bytes = sizeof(SplitType) * num_split * padded_K_size;
+    SplitType *C_or_D_splits = nullptr;
+    SplitType *cderi_splits = nullptr;
+    SplitType *rho_K_splits = nullptr;
+    SplitType *padded_K_splits = nullptr;
+    CUDA_CHECK( cudaMalloc((void **) &C_or_D_splits, C_or_D_splits_bytes) );
+    CUDA_CHECK( cudaMalloc((void **) &cderi_splits, cderi_splits_bytes) );
+    CUDA_CHECK( cudaMalloc((void **) &rho_K_splits, rho_K_splits_bytes) );
+    CUDA_CHECK( cudaMalloc((void **) &padded_K_splits, padded_K_splits_bytes) );
+
+    SPLIT_POINTERS(C_or_D_splits, padded_C_or_D_size);
+
+    dim3 block(32, 32);
+    dim3 grid((padded_nao + block.x - 1) / block.x, (padded_C_or_D_ncol + block.y - 1) / block.y);
+    #define DISPATCH_SPLIT_FP_ARRAY(num_split) \
+    do { \
+        split_C_or_D_mat_kernel<num_split, double, SplitType><<<grid, block, 0, stream>>>( \
+            nao, padded_nao, C_or_D_ncol, padded_C_or_D_ncol, C_or_D_mat, \
+            C_or_D_splits_0, C_or_D_splits_1, C_or_D_splits_2, C_or_D_splits_3 \
+        ); \
+    } while (0)
+    if (num_split == 1) DISPATCH_SPLIT_FP_ARRAY(1);
+    if (num_split == 2) DISPATCH_SPLIT_FP_ARRAY(2);
+    if (num_split == 3) DISPATCH_SPLIT_FP_ARRAY(3);
+    if (num_split == 4) DISPATCH_SPLIT_FP_ARRAY(4);
+    CUDA_CHECK( cudaGetLastError() );
+    #undef DISPATCH_SPLIT_FP_ARRAY
+
+    #define DISPATCH_UNPACK_SYM_SPLIT_CDERI_WORK(SplitType) \
+    do { \
+        unpack_sym_split_cderi_work<SplitType>( \
+            stream, npair, rows, cols, naux_blk, padded_nao, \
+            cderi_sparse_blk, num_split, \
+            cderi_splits, padded_cderi_size \
+        ); \
+    } while (0)
+    #define DISPATCH_DF_K_BUILD_WORK(num_split, OutType, SplitType) \
+    do { \
+        DF_K_build_work<num_split, OutType, SplitType>( \
+            stream, use_Dmat, naux_blk, nao, padded_nao, padded_nocc, \
+            cderi_splits, padded_cderi_size, \
+            C_or_D_splits, padded_C_or_D_size, \
+            rho_K_splits, rho_K_size, \
+            padded_K_splits, padded_K_size, \
+            K_mat \
+        ); \
+    } while (0)
+    for (int i = 0; i < naux; i += max_naux_blk)
+    {
+        int naux_blk = (i + max_naux_blk < naux) ? max_naux_blk : (naux - i);
+        size_t cderi_sparse_offset = static_cast<size_t>(i) * static_cast<size_t>(npair);
+        const double *cderi_sparse_blk = cderi_sparse + cderi_sparse_offset;
+        DISPATCH_UNPACK_SYM_SPLIT_CDERI_WORK(SplitType);
+        if (num_split == 1) DISPATCH_DF_K_BUILD_WORK(1, double, SplitType);
+        if (num_split == 2) DISPATCH_DF_K_BUILD_WORK(2, double, SplitType);
+        if (num_split == 3) DISPATCH_DF_K_BUILD_WORK(3, double, SplitType);
+        if (num_split == 4) DISPATCH_DF_K_BUILD_WORK(4, double, SplitType);
+    }
+    #undef DISPATCH_UNPACK_SYM_SPLIT_CDERI_WORK
+    #undef DISPATCH_DF_K_BUILD_WORK
+
+    CUDA_CHECK( cudaFree(C_or_D_splits) );
+    CUDA_CHECK( cudaFree(cderi_splits) );
+    CUDA_CHECK( cudaFree(rho_K_splits) );
+    CUDA_CHECK( cudaFree(padded_K_splits) );
 }
 
 extern "C" {
 
-int unpack_sym_split_cderi(
-    cudaStream_t stream, const int nnz, const int *rows, const int *cols,
-    const int naux_blk, const int nrow, const int itype_bytes,
-    const void *cderi_sparse, const int num_split, const int otype_bytes,
-    void *cderi_0, void *cderi_1, void *cderi_2, void *cderi_3
+int DF_JK_build(
+    cudaStream_t stream, const int naux, const int nao, const int nocc,
+    const int num_split, const int split_dtype_bytes, const int use_Dmat,
+    const int npair, const int *rows, const int *cols,
+    const void *cderi_sparse, const void *C_or_D_mat, const void *D_mat_sparse,
+    const int build_J, const int build_K, void *J_mat_sparse, void *K_mat,
+    const size_t avail_mem_bytes
 )
 {
     ERROR_CHECK(num_split >= 1 && num_split <= 4, "num_split must be between 1 and 4.");
 
-    if (nnz != cderi_nnz)
-    {
-        CUDA_CHECK( cudaFree(cderi_rows_d) );
-        CUDA_CHECK( cudaFree(cderi_cols_d) );
-        cderi_nnz = nnz;
-        CUDA_CHECK( cudaMalloc((void**) &cderi_rows_d, nnz * sizeof(int)) );
-        CUDA_CHECK( cudaMalloc((void**) &cderi_cols_d, nnz * sizeof(int)) );
-        size_t rows_cols_bytes = sizeof(int) * nnz;
-        CUDA_CHECK( cudaMemcpyAsync(cderi_rows_d, rows, rows_cols_bytes, cudaMemcpyHostToDevice, stream) );
-        CUDA_CHECK( cudaMemcpyAsync(cderi_cols_d, cols, rows_cols_bytes, cudaMemcpyHostToDevice, stream) );
-    }
-
-    dim3 block(16, 16), grid(naux_blk);
-    #define DISPATCH_UNPACK_SYM_SPLIT_CDERI(itype, otype, num_split) \
+    const double *cderi_sparse_d = static_cast<const double *>(cderi_sparse);
+    const double *C_or_D_mat_d = static_cast<const double *>(C_or_D_mat);
+    const double *D_mat_sparse_d = static_cast<const double *>(D_mat_sparse);
+    double *J_mat_sparse_d = static_cast<double *>(J_mat_sparse);
+    double *K_mat_d = static_cast<double *>(K_mat);
+    #define DISPATCH_DF_JK_BUILD_WORK(SplitType) \
     do { \
-        unpack_sym_split_cderi_kernel<num_split, itype, otype><<<grid, block, 0, stream>>>( \
-            nnz, cderi_rows_d, cderi_cols_d, nrow, \
-            static_cast<const itype*>(cderi_sparse), \
-            static_cast<otype*>(cderi_0), \
-            static_cast<otype*>(cderi_1), \
-            static_cast<otype*>(cderi_2), \
-            static_cast<otype*>(cderi_3) \
-        ); \
-        CUDA_CHECK(cudaGetLastError()); \
-    } while (0)
-    if (itype_bytes == 8 && otype_bytes == 8)
-    {
-        if (num_split == 1) DISPATCH_UNPACK_SYM_SPLIT_CDERI(double, double, 1);
-        if (num_split == 2) DISPATCH_UNPACK_SYM_SPLIT_CDERI(double, double, 2);
-        if (num_split == 3) DISPATCH_UNPACK_SYM_SPLIT_CDERI(double, double, 3);
-        if (num_split == 4) DISPATCH_UNPACK_SYM_SPLIT_CDERI(double, double, 4);
-    }
-    else if (itype_bytes == 8 && otype_bytes == 4)
-    {
-        if (num_split == 1) DISPATCH_UNPACK_SYM_SPLIT_CDERI(double, float, 1);
-        if (num_split == 2) DISPATCH_UNPACK_SYM_SPLIT_CDERI(double, float, 2);
-        if (num_split == 3) DISPATCH_UNPACK_SYM_SPLIT_CDERI(double, float, 3);
-        if (num_split == 4) DISPATCH_UNPACK_SYM_SPLIT_CDERI(double, float, 4);
-    }
-    else if (itype_bytes == 8 && otype_bytes == 2)
-    {
-        if (num_split == 1) DISPATCH_UNPACK_SYM_SPLIT_CDERI(double, __half, 1);
-        if (num_split == 2) DISPATCH_UNPACK_SYM_SPLIT_CDERI(double, __half, 2);
-        if (num_split == 3) DISPATCH_UNPACK_SYM_SPLIT_CDERI(double, __half, 3);
-        if (num_split == 4) DISPATCH_UNPACK_SYM_SPLIT_CDERI(double, __half, 4);
-    }
-    else if (itype_bytes == 4 && otype_bytes == 4)
-    {
-        if (num_split == 1) DISPATCH_UNPACK_SYM_SPLIT_CDERI(float, float, 1);
-        if (num_split == 2) DISPATCH_UNPACK_SYM_SPLIT_CDERI(float, float, 2);
-        if (num_split == 3) DISPATCH_UNPACK_SYM_SPLIT_CDERI(float, float, 3);
-        if (num_split == 4) DISPATCH_UNPACK_SYM_SPLIT_CDERI(float, float, 4);
-    }
-    else
-    {
-        fprintf(stderr, "[ERROR][%s:%s] Unsupported itype_bytes (%d) or otype_bytes (%d).\n",
-                __FILE__, __FUNCTION__, itype_bytes, otype_bytes);
-        return 1;
-    }
-    #undef DISPATCH_UNPACK_SYM_SPLIT_CDERI
-
-    CUDA_CHECK( cudaStreamSynchronize(stream) );
-    CUDA_CHECK( cudaGetLastError() );
-    return 0;
-}
-
-
-int DF_K_build(
-    cudaStream_t stream, const int use_Dmat,
-    const int naux_blk, const int nao, const int padded_nao, const int padded_nocc,
-    const int num_split, const int split_dtype_bytes,
-    void *cderi_split_0, void *cderi_split_1, void *cderi_split_2, void *cderi_split_3,
-    void *C_or_D_split_0, void *C_or_D_split_1, void *C_or_D_split_2, void *C_or_D_split_3, 
-    void *mat_K
-)
-{
-    ERROR_CHECK(num_split >= 1 && num_split <= 4, "num_split must be between 1 and 4.");
-    ERROR_CHECK(mat_K != nullptr, "mat_K must not be nullptr.");
-
-    #define DISPATCH_DF_K_BUILD_WORK(num_split, out_dytpe, split_dtype) \
-    do { \
-        out_dytpe *mat_K_ = reinterpret_cast<out_dytpe*>(mat_K); \
-        DF_K_build_work<num_split, out_dytpe, split_dtype>( \
-            stream, use_Dmat, naux_blk, nao, padded_nao, padded_nocc, \
-            static_cast<split_dtype *>(cderi_split_0), \
-            static_cast<split_dtype *>(cderi_split_1), \
-            static_cast<split_dtype *>(cderi_split_2), \
-            static_cast<split_dtype *>(cderi_split_3), \
-            static_cast<split_dtype *>(C_or_D_split_0), \
-            static_cast<split_dtype *>(C_or_D_split_1), \
-            static_cast<split_dtype *>(C_or_D_split_2), \
-            static_cast<split_dtype *>(C_or_D_split_3), \
-            mat_K_ \
+        DF_JK_build_work<SplitType>( \
+            stream, naux, nao, nocc, num_split, use_Dmat, \
+            npair, rows, cols, \
+            cderi_sparse_d, C_or_D_mat_d, D_mat_sparse_d, \
+            build_J, build_K, J_mat_sparse_d, K_mat_d, avail_mem_bytes \
         ); \
     } while (0)
-    if (split_dtype_bytes == 8)
-    {
-        ERROR_CHECK(num_split == 1, "num_split must be 1 when split_dtype is double.");
-        DISPATCH_DF_K_BUILD_WORK(1, double, double);
-    }
-    else if (split_dtype_bytes == 4)
-    {
-        if (num_split == 1) DISPATCH_DF_K_BUILD_WORK(1, double, float);
-        if (num_split == 2) DISPATCH_DF_K_BUILD_WORK(2, double, float);
-        if (num_split == 3) DISPATCH_DF_K_BUILD_WORK(3, double, float);
-        if (num_split == 4) DISPATCH_DF_K_BUILD_WORK(4, double, float);
-    }
-    else if (split_dtype_bytes == 2)
-    {
-        if (num_split == 1) DISPATCH_DF_K_BUILD_WORK(1, double, __half);
-        if (num_split == 2) DISPATCH_DF_K_BUILD_WORK(2, double, __half);
-        if (num_split == 3) DISPATCH_DF_K_BUILD_WORK(3, double, __half);
-        if (num_split == 4) DISPATCH_DF_K_BUILD_WORK(4, double, __half);
-    }
+    if (split_dtype_bytes == 8) DISPATCH_DF_JK_BUILD_WORK(double);
+    else if (split_dtype_bytes == 4) DISPATCH_DF_JK_BUILD_WORK(float);
+    else if (split_dtype_bytes == 2) DISPATCH_DF_JK_BUILD_WORK(__half);
     else
     {
-        fprintf(
-            stderr, "[ERROR][%s:%d] split_dtype must be double, float, or __half.\n",
-            __FUNCTION__, __LINE__
-        );
+        fprintf(stderr, "[ERROR][%s:%d] Unsupported split_dtype_bytes (%d).\n",
+                __FUNCTION__, __LINE__, split_dtype_bytes);
         return 1;
     }
-    #undef DISPATCH_DF_K_BUILD_WORK
+    #undef DISPATCH_DF_JK_BUILD_WORK
 
     CUDA_CHECK( cudaStreamSynchronize(stream) );
     CUDA_CHECK( cudaGetLastError() );

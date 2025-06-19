@@ -28,13 +28,11 @@ from gpu4pyscf.df import int3c2e_bdiv
 from gpu4pyscf.lib import logger
 from gpu4pyscf import __config__
 from gpu4pyscf.__config__ import _streams, num_devices
-from gpu4pyscf.mxp_df_helper.helper import (
-    OzakiSchemeHelper,
+from gpu4pyscf.lib.mxp_df_helper import (
     mxp_df_level_to_split_dtype,
     get_gemm_padding,
+    FpSplitHelper
 )
-import pdb
-from gpu4pyscf.lib.mxp_df_helper import unpack_sym_split_cderi
 
 MIN_BLK_SIZE = getattr(__config__, 'min_ao_blksize', 128)
 ALIGNED = getattr(__config__, 'ao_aligned', 32)
@@ -201,38 +199,14 @@ class DF(lib.StreamObject):
                     buf2 = buf_cderi[:p1-p0]
                 else:
                     cderi_sparse_buf = buf
-                    """
-                    cderi_sparse_os = OzakiSchemeHelper(cupy.float64)
-                    cderi_sparse_os.split(num_split, split_dtype, cderi_sparse_buf)
+                    cderi_sparse_split = FpSplitHelper(cupy.float64)
+                    cderi_sparse_split.split(num_split, split_dtype, cderi_sparse_buf)
                     cderi_dense_split_tensors = [cupy.zeros([blksize, padded_nao, padded_nao], dtype=split_dtype) for _ in range(num_split)]
                     for i in range(num_split):
-                        cderi_dense_split_tensors[i][:p1-p0, rows, cols] = cderi_sparse_os.split_tensors[i]
-                        cderi_dense_split_tensors[i][:p1-p0, cols, rows] = cderi_sparse_os.split_tensors[i]
-                    cderi_dense_os = OzakiSchemeHelper(cupy.float64, num_split, split_dtype, cderi_dense_split_tensors)
-                    """
-                    
-                    split_tensors = [cupy.zeros([blksize, padded_nao, padded_nao], dtype=split_dtype) for _ in range(num_split)]
-                    cderi_0 = split_tensors[0]
-                    cderi_1 = split_tensors[1] if num_split > 1 else None
-                    cderi_2 = split_tensors[2] if num_split > 2 else None
-                    cderi_3 = split_tensors[3] if num_split > 3 else None
-                    itype_bytes = cderi_sparse_buf.itemsize
-                    if split_dtype == cupy.float64:
-                        otype_bytes = 8
-                    elif split_dtype == cupy.float32:
-                        otype_bytes = 4
-                    elif split_dtype == cupy.float16:
-                        otype_bytes = 2
-                    else:
-                        raise ValueError(f'Unsupported split_dtype {split_dtype}')
-                    unpack_sym_split_cderi(
-                        rows, cols, itype_bytes, cderi_sparse_buf, 
-                        padded_nao, num_split, otype_bytes, 
-                        cderi_0, cderi_1, cderi_2, cderi_3
-                    )
-                    cderi_dense_os = OzakiSchemeHelper(cupy.float64, num_split, split_dtype, split_tensors)
-                    
-                    buf2 = cderi_dense_os
+                        cderi_dense_split_tensors[i][:p1-p0, rows, cols] = cderi_sparse_split.split_tensors[i]
+                        cderi_dense_split_tensors[i][:p1-p0, cols, rows] = cderi_sparse_split.split_tensors[i]
+                    cderi_dense_split = FpSplitHelper(cupy.float64, num_split, split_dtype, cderi_dense_split_tensors)
+                    buf2 = cderi_dense_split
             else:
                 buf2 = None
             yield buf2, buf.T
