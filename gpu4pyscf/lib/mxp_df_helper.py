@@ -102,11 +102,21 @@ class FpSplitHelper:
         self.input_dtype = input_dtype
         self.split_dtype = split_dtype
 
+        scaling_factor = 1
+        if split_dtype == cupy.float16:
+            # e5m9, 10 bits of effective precision
+            scaling_factor = 2 ** 10
+        if split_dtype == cupy.float32:
+            # e8m23, 24 bits of effective precision
+            scaling_factor = 2 ** 24
+
         curr_tensor = input_tensor
-        for _ in range(num_split):
+        for i in range(num_split):
             split_tensor = curr_tensor.astype(split_dtype)
             self.split_tensors.append(split_tensor)
-            curr_tensor = curr_tensor - split_tensor.astype(input_dtype)
+            if i < num_split - 1:
+                curr_tensor = curr_tensor - split_tensor.astype(input_dtype)
+                curr_tensor *= scaling_factor
 
     def reshape(self, new_shape: Union[List[int], Tuple[int]]):
         """
@@ -131,8 +141,18 @@ class FpSplitHelper:
         Return the split tensors cast back to the original input dtype.
         """
         output_tensor = cupy.zeros_like(self.split_tensors[0], dtype=self.input_dtype)
-        for tensor in self.split_tensors:
-            output_tensor += tensor.astype(self.input_dtype)
+        scale_inv = 1
+        if self.split_dtype == cupy.float16:
+            # e5m9, 10 bits of effective precision
+            scale_inv = 2 ** (-10)
+        if self.split_dtype == cupy.float32:
+            # e8m23, 24 bits of effective precision
+            scale_inv = 2 ** (-24)
+        curr_scale_inv = 1
+        for i in range(self.num_split):
+            upcast_tensor = self.split_tensors[i].astype(self.input_dtype)
+            output_tensor += curr_scale_inv * upcast_tensor
+            curr_scale_inv *= scale_inv
         return output_tensor
 
 

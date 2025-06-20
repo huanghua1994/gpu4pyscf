@@ -81,18 +81,27 @@ __global__ void split_C_or_D_mat_kernel(
     const int output_idx = row * padded_ncol + col;
     IType in_value = (row < nrow && col < ncol) ?
         input[input_idx] : static_cast<IType>(0);
+    IType level_scale = 1.0;
+    // FP16: e5m9, 10 bits of effective precision
+    if (std::is_same_v<IType, __half>) level_scale = 1024.0;
+    // FP32: e8m23, 24 bits of effective precision
+    if (std::is_same_v<IType, float>) level_scale = 16777216.0;
+
     SplitType out_value0 = static_cast<SplitType>(in_value);
     output_0[output_idx] = out_value0;
-    in_value -= static_cast<IType>(out_value0);
     if constexpr(num_split == 1) return;
+
+    in_value = level_scale * (in_value - static_cast<IType>(out_value0));
     SplitType out_value1 = static_cast<SplitType>(in_value);
     output_1[output_idx] = out_value1;
-    in_value -= static_cast<IType>(out_value1);
     if constexpr(num_split == 2) return;
+
+    in_value = level_scale * (in_value - static_cast<IType>(out_value1));
     SplitType out_value2 = static_cast<SplitType>(in_value);
     output_2[output_idx] = out_value2;
-    in_value -= static_cast<IType>(out_value2);
     if constexpr(num_split == 3) return;
+
+    in_value = level_scale * (in_value - static_cast<IType>(out_value2));
     SplitType out_value3 = static_cast<SplitType>(in_value);
     output_3[output_idx] = out_value3;
 }
@@ -109,6 +118,11 @@ __global__ void unpack_sym_split_cderi_kernel(
     const int bid = blockIdx.x;
     const int thread_block_size = blockDim.x * blockDim.y;
     const int mat_size = nrow * nrow;
+    IType level_scale = 1.0;
+    // FP16: e5m9, 10 bits of effective precision
+    if (std::is_same_v<IType, __half>) level_scale = 1024.0;
+    // FP32: e8m23, 24 bits of effective precision
+    if (std::is_same_v<IType, float>) level_scale = 16777216.0;
     for (int pair_id = tid; pair_id < npair; pair_id += thread_block_size)
     {
         if (pair_id > npair) continue;
@@ -122,17 +136,20 @@ __global__ void unpack_sym_split_cderi_kernel(
         cderi_0[output_idx0] = out_value0;
         cderi_0[output_idx1] = out_value0;
         if constexpr(num_split == 1) continue;
-        in_value -= static_cast<IType>(out_value0);
+
+        in_value = level_scale * (in_value - static_cast<IType>(out_value0));
         SplitType out_value1 = static_cast<SplitType>(in_value);
         cderi_1[output_idx0] = out_value1;
         cderi_1[output_idx1] = out_value1;
         if constexpr(num_split == 2) continue;
-        in_value -= static_cast<IType>(out_value1);
+
+        in_value = level_scale * (in_value - static_cast<IType>(out_value1));
         SplitType out_value2 = static_cast<SplitType>(in_value);
         cderi_2[output_idx0] = out_value2;
         cderi_2[output_idx1] = out_value2;
         if constexpr(num_split == 3) continue;
-        in_value -= static_cast<IType>(out_value2);
+
+        in_value = level_scale * (in_value - static_cast<IType>(out_value2));
         SplitType out_value3 = static_cast<SplitType>(in_value);
         cderi_3[output_idx0] = out_value3;
         cderi_3[output_idx1] = out_value3;
@@ -149,15 +166,30 @@ __global__ void sum_rho_K_splits_kernel(
 {
     const int row = blockIdx.x * blockDim.x + threadIdx.x;
     const int col = blockIdx.y * blockDim.y + threadIdx.y;
+    OutType level_inv_scale = 1.0;
+    // FP16: e5m9, 10 bits of effective precision
+    if (std::is_same_v<SplitType, __half>) level_inv_scale = 1.0 / 1024.0;
+    // FP32: e8m23, 24 bits of effective precision
+    if (std::is_same_v<SplitType, float>) level_inv_scale = 1.0 / 16777216.0;
     if (row < nao && col < nao)
     {
         int src_idx = row * padded_nao + col;
         int dst_idx = row * nao + col;
         OutType K_val = mat_K[dst_idx];
         K_val += static_cast<OutType>(padded_K_0[src_idx]);
-        if constexpr(num_split >= 2) K_val += static_cast<OutType>(padded_K_1[src_idx]);
-        if constexpr(num_split >= 3) K_val += static_cast<OutType>(padded_K_2[src_idx]);
-        if constexpr(num_split >= 4) K_val += static_cast<OutType>(padded_K_3[src_idx]);
+        OutType curr_scale_inv = level_inv_scale;
+        if constexpr(num_split >= 2)
+            K_val += curr_scale_inv * static_cast<OutType>(padded_K_1[src_idx]);
+        if constexpr(num_split >= 3)
+        {
+            curr_scale_inv *= level_inv_scale;
+            K_val += curr_scale_inv * static_cast<OutType>(padded_K_2[src_idx]);
+        }
+        if constexpr(num_split >= 4)
+        {
+            curr_scale_inv *= level_inv_scale;
+            K_val += curr_scale_inv * static_cast<OutType>(padded_K_3[src_idx]);
+        }
         mat_K[dst_idx] = K_val;
     }
 }
