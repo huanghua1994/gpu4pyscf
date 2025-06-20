@@ -15,7 +15,6 @@ def load_library(libname):
 libmxp_df_helper = load_library('libmxp_df_helper')
 
 _use_cuda_jk_build = os.getenv('MXP_DF_USE_CUDA_JK_BUILD', '1') == '1'
-_cupy_mempool_cleared = False
 
 cuda_device_cc = int(cupy.cuda.device.get_compute_capability())
 
@@ -224,12 +223,6 @@ def cuda_jk_build(
     assert len(rows) == len(cols)
     npair = len(rows)
 
-    global _cupy_mempool_cleared
-    if not _cupy_mempool_cleared:
-        cupy.get_default_memory_pool().free_all_blocks()
-        cupy.get_default_pinned_memory_pool().free_all_blocks()
-        _cupy_mempool_cleared = True
-
     if split_dtype == cupy.float64:
         split_dtype_bytes = 8
     elif split_dtype == cupy.float32:
@@ -245,6 +238,21 @@ def cuda_jk_build(
 
     J_mat_sparse_ptr = J_mat_sparse.data.ptr if J_mat_sparse is not None else 0
     K_mat_ptr = K_mat.data.ptr if K_mat is not None else 0
+
+    padded_nao = get_gemm_padding(nao)
+    blk_size = avail_mem_bytes // (split_dtype_bytes * num_split)
+    blk_size -= padded_nao * padded_nao  # C or D
+    blk_size = blk_size // (3 * padded_nao * padded_nao)  # cderi, rho_K, K
+    if blk_size < 32:
+        raise RuntimeError(f"Not enough memory for CUDA DF JK build with minimal blk_size = 32, got {blk_size=}")
+    blk_size = get_gemm_padding(blk_size-32, alignment=32)
+    if blk_size > 1024:
+        blk_size = 1024
+    workbuf_bytes = padded_nao * padded_nao  # C or D
+    workbuf_bytes += 3 * padded_nao * padded_nao * blk_size  # cderi, rho_K, K
+    workbuf_bytes *= split_dtype_bytes * num_split
+    workbuf_bytes += 32 * 1024 * 1024 + 1024  # cuBLAS workspace and padding for aligment
+    workbuf = cupy.empty(workbuf_bytes, dtype=cupy.uint8)
 
     err = libmxp_df_helper.DF_JK_build(
         ctypes.cast(stream.ptr, ctypes.c_void_p),
@@ -264,7 +272,8 @@ def cuda_jk_build(
         ctypes.c_int(build_K),
         ctypes.cast(J_mat_sparse_ptr, ctypes.c_void_p),
         ctypes.cast(K_mat_ptr, ctypes.c_void_p),
-        ctypes.c_size_t(avail_mem_bytes),
+        ctypes.c_int(blk_size),
+        ctypes.cast(workbuf.data.ptr, ctypes.c_void_p),
     )
 
     if err != 0:

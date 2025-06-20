@@ -166,13 +166,6 @@ __global__ void sum_rho_K_splits_kernel(
 // =============== Helper functions ===============
 
 #define DF_K_BUILD_SUBTASK_COMMON \
-    if (cublas_handle == nullptr) \
-    { \
-        CUBLAS_CHECK( cublasCreate(&cublas_handle) ); \
-        CUBLAS_CHECK( cublasLtCreate(&lt_handle) ); \
-        CUDA_CHECK( cudaMalloc((void**) &cublas_workspace, cublas_workspace_bytes) ); \
-    } \
-    CUBLAS_CHECK( cublasSetStream(cublas_handle, stream) ); \
     cublasComputeType_t compute_type; \
     cudaDataType_t AB_type, C_type, scale_type; \
     get_cublas_gemm_dtypes<SplitType>(compute_type, AB_type, C_type, scale_type);
@@ -224,24 +217,20 @@ void get_cublas_gemm_dtypes(
 }
 
 
+static uint8_t *move_ptr_to_next_256B_aligned(uint8_t *ptr)
+{
+  return reinterpret_cast<uint8_t *>((reinterpret_cast<uintptr_t>(ptr) + 255) &
+                                     ~static_cast<uintptr_t>(255));
+}
+
 // =============== Work functions with type template parameters ===============
 
 void DF_J_build_work(
     cudaStream_t stream, const int naux_blk, const int npair, const int init_output,
-    const double *cderi_sparse, const double *D_mat_sparse, double *J_mat_sparse
+    const double *cderi_sparse, const double *D_mat_sparse, double *J_mat_sparse,
+    double *rho_j
 )
 {
-    double *rho_j = nullptr;
-    CUDA_CHECK( cudaMalloc((void **) &rho_j, sizeof(double) * naux_blk) );
-
-    if (cublas_handle == nullptr)
-    {
-        CUBLAS_CHECK( cublasCreate(&cublas_handle) );
-        CUBLAS_CHECK( cublasLtCreate(&lt_handle) );
-        CUDA_CHECK( cudaMalloc((void**) &cublas_workspace, cublas_workspace_bytes) );
-    }
-    CUBLAS_CHECK( cublasSetStream(cublas_handle, stream) );
-
     // Step 1: GEMV: cderi_sparse [naux_blk, npair] * D_mat_sparse [npair] -> rho_j [naux_blk]
     cublasOperation_t trans = CUBLAS_OP_T;
     int m = npair, n = naux_blk;  // Swap parameters to match cuBLAS's column-major order
@@ -265,8 +254,6 @@ void DF_J_build_work(
         cublas_handle, trans, m, n, alpha,
         A, ldA, x, incx, beta, y, incy
     ) );
-
-    CUDA_CHECK( cudaFree(rho_j) );
 }
 
 
@@ -505,11 +492,28 @@ void DF_JK_build_work(
     const int use_Dmat, const int npair, const int *rows, const int *cols,
     const double *cderi_sparse, const double *C_or_D_mat, const double *D_mat_sparse,
     const int build_J, const int build_K, double *J_mat_sparse, double *K_mat,
-    const size_t avail_mem_bytes
+    const int max_naux_blk, void *workbuf
 )
 {
+    if (cublas_handle == nullptr)
+    {
+        CUBLAS_CHECK( cublasCreate(&cublas_handle) );
+        CUBLAS_CHECK( cublasLtCreate(&lt_handle) );
+    }
+    CUBLAS_CHECK( cublasSetStream(cublas_handle, stream) );
+
+    uint8_t *workbuf_ptr = static_cast<uint8_t *>(workbuf);
+    workbuf_ptr = move_ptr_to_next_256B_aligned(workbuf_ptr);
+    cublas_workspace = workbuf_ptr;
+    workbuf_ptr += cublas_workspace_bytes;
+
     if (build_J)
-        DF_J_build_work(stream, naux, npair, 1, cderi_sparse, D_mat_sparse, J_mat_sparse);
+    {
+        DF_J_build_work(
+            stream, naux, npair, 1, cderi_sparse, D_mat_sparse,
+            J_mat_sparse, reinterpret_cast<double *>(workbuf_ptr)
+        );
+    }
 
     if (!build_K) return;
     int padded_nao = pad_size_for_gemm(nao);
@@ -517,36 +521,15 @@ void DF_JK_build_work(
     int C_or_D_ncol = use_Dmat ? nao : nocc;
     int padded_C_or_D_ncol = use_Dmat ? padded_nao : padded_nocc;
     size_t padded_C_or_D_size = padded_nao * padded_C_or_D_ncol;
-    size_t max_naux_blk = (avail_mem_bytes * 4 / 5 - sizeof(SplitType) * num_split * padded_C_or_D_size);
-    max_naux_blk /= (sizeof(SplitType) * num_split * padded_nao * padded_nao * 3);
-    max_naux_blk = pad_size_for_gemm(max_naux_blk);
-    if (max_naux_blk > 1024) max_naux_blk = 1024;
-    if (max_naux_blk < GEMM_ALIGNMENT)
-    {
-        fprintf(
-            stderr, "[ERROR][%s:%d] For DF JK build, calculate block size %d < threshold %d\n",
-            __FUNCTION__, __LINE__, max_naux_blk, GEMM_ALIGNMENT
-        );
-        return;
-    }
     size_t padded_cderi_size = max_naux_blk * padded_nao * padded_nao;
     size_t rho_K_size = max_naux_blk * padded_nao * padded_C_or_D_ncol;
     size_t padded_K_size = max_naux_blk * padded_nao * padded_nao;
-    size_t C_or_D_splits_bytes = sizeof(SplitType) * num_split * padded_C_or_D_size;
-    size_t cderi_splits_bytes = sizeof(SplitType) * num_split * padded_cderi_size;
-    size_t rho_K_splits_bytes = sizeof(SplitType) * num_split * rho_K_size;
-    size_t padded_K_splits_bytes = sizeof(SplitType) * num_split * padded_K_size;
-    SplitType *C_or_D_splits = nullptr;
-    SplitType *cderi_splits = nullptr;
-    SplitType *rho_K_splits = nullptr;
-    SplitType *padded_K_splits = nullptr;
-    CUDA_CHECK( cudaMalloc((void **) &C_or_D_splits, C_or_D_splits_bytes) );
-    CUDA_CHECK( cudaMalloc((void **) &cderi_splits, cderi_splits_bytes) );
-    CUDA_CHECK( cudaMalloc((void **) &rho_K_splits, rho_K_splits_bytes) );
-    CUDA_CHECK( cudaMalloc((void **) &padded_K_splits, padded_K_splits_bytes) );
+    SplitType *C_or_D_splits = reinterpret_cast<SplitType *>(workbuf_ptr);
+    SplitType *cderi_splits = C_or_D_splits + num_split * padded_C_or_D_size;
+    SplitType *rho_K_splits = cderi_splits + num_split * padded_cderi_size;
+    SplitType *padded_K_splits = rho_K_splits + num_split * rho_K_size;
 
     SPLIT_POINTERS(C_or_D_splits, padded_C_or_D_size);
-
     dim3 block(32, 32);
     dim3 grid((padded_nao + block.x - 1) / block.x, (padded_C_or_D_ncol + block.y - 1) / block.y);
     #define DISPATCH_SPLIT_FP_ARRAY(num_split) \
@@ -595,11 +578,6 @@ void DF_JK_build_work(
     }
     #undef DISPATCH_UNPACK_SYM_SPLIT_CDERI_WORK
     #undef DISPATCH_DF_K_BUILD_WORK
-
-    CUDA_CHECK( cudaFree(C_or_D_splits) );
-    CUDA_CHECK( cudaFree(cderi_splits) );
-    CUDA_CHECK( cudaFree(rho_K_splits) );
-    CUDA_CHECK( cudaFree(padded_K_splits) );
 }
 
 extern "C" {
@@ -610,7 +588,7 @@ int DF_JK_build(
     const int npair, const int *rows, const int *cols,
     const void *cderi_sparse, const void *C_or_D_mat, const void *D_mat_sparse,
     const int build_J, const int build_K, void *J_mat_sparse, void *K_mat,
-    const size_t avail_mem_bytes
+    const int max_naux_blk, void *workbuf
 )
 {
     ERROR_CHECK(num_split >= 1 && num_split <= 4, "num_split must be between 1 and 4.");
@@ -624,9 +602,9 @@ int DF_JK_build(
     do { \
         DF_JK_build_work<SplitType>( \
             stream, naux, nao, nocc, num_split, use_Dmat, \
-            npair, rows, cols, \
-            cderi_sparse_d, C_or_D_mat_d, D_mat_sparse_d, \
-            build_J, build_K, J_mat_sparse_d, K_mat_d, avail_mem_bytes \
+            npair, rows, cols, cderi_sparse_d, \
+            C_or_D_mat_d, D_mat_sparse_d, build_J, build_K, \
+            J_mat_sparse_d, K_mat_d, max_naux_blk, workbuf \
         ); \
     } while (0)
     if (split_dtype_bytes == 8) DISPATCH_DF_JK_BUILD_WORK(double);
