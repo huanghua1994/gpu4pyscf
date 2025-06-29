@@ -50,12 +50,6 @@
     } while (0)
 
 
-static int cderi_npair = 0;
-static int *cderi_rows_h = nullptr;
-static int *cderi_cols_h = nullptr;
-static int *cderi_rows_d = nullptr;
-static int *cderi_cols_d = nullptr;
-
 static double f64_one = 1, f64_zero = 0;
 static float  f32_one = 1, f32_zero = 0;
 
@@ -168,43 +162,50 @@ __global__ void split_C_or_D_mat_kernel(
 
 template<int num_split, typename InType, typename SplitType>
 __global__ void unpack_sym_split_cderi_kernel(
-    const int npair, const int* __restrict__ rows, const int* __restrict__ cols,
-    const int nrow, const InType* __restrict__ cderi_sparse, const int rho_int,
+    const int nnz, const int* __restrict__ rows, const int* __restrict__ cols,
+    const int* __restrict__ blk_nnz_displs, const int* __restrict__ blk_nnz_orig_idx,
+    const int padded_nao, const InType* __restrict__ cderi_sparse, const int rho_int,
     SplitType* __restrict__ cderi_0, SplitType* __restrict__ cderi_1,
     SplitType* __restrict__ cderi_2, SplitType* __restrict__ cderi_3
 )
 {
-    const int tid = threadIdx.x + threadIdx.y * blockDim.x;
-    const int bid = blockIdx.x;
-    const int thread_block_size = blockDim.x * blockDim.y;
-    const int mat_size = nrow * nrow;
-    for (int pair_id = tid; pair_id < npair; pair_id += thread_block_size)
+    const int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    const int blk_id = blockIdx.y * gridDim.x + blockIdx.x;
+    const int blk_nnz_start = blk_nnz_displs[blk_id];
+    const int blk_nnz_end = blk_nnz_displs[blk_id + 1];
+    const int blk_nnz = blk_nnz_end - blk_nnz_start;
+
+    int row = 0, col = 0, input_idx = 0;
+    InType in_value = 0;
+    if (tid < blk_nnz)
     {
-        if (pair_id > npair) continue;
-        int row = rows[pair_id];
-        int col = cols[pair_id];
-        size_t input_idx = bid * npair + pair_id;
-        size_t output_idx0 = bid * mat_size + row * nrow + col;
-        size_t output_idx1 = bid * mat_size + col * nrow + row;
-        InType in_value = cderi_sparse[input_idx];
+        int nnz_idx = blk_nnz_orig_idx[blk_nnz_start + tid];
+        row = rows[nnz_idx];
+        col = cols[nnz_idx];
+        input_idx = blockIdx.z * nnz + nnz_idx;
+        in_value = cderi_sparse[input_idx];
+        size_t padded_nao2 = padded_nao * padded_nao;
+        size_t output_idx0 = blockIdx.z * padded_nao2 + row * padded_nao + col;
+        size_t output_idx1 = blockIdx.z * padded_nao2 + col * padded_nao + row;
 
         if constexpr(std::is_same_v<SplitType, double>)
         {
             cderi_0[output_idx0] = in_value;
             cderi_0[output_idx1] = in_value;
-            continue;
         }
 
         if constexpr(std::is_same_v<SplitType, __half>)
         {
-            os_fp_split<num_split>(
-                in_value, rho_int, cderi_0 + output_idx0, cderi_1 + output_idx0,
-                cderi_2 + output_idx0, cderi_3 + output_idx0
-            );
-            cderi_0[output_idx1] = cderi_0[output_idx0];
-            if constexpr(num_split >= 2) cderi_1[output_idx1] = cderi_1[output_idx0];
-            if constexpr(num_split >= 3) cderi_2[output_idx1] = cderi_2[output_idx0];
-            if constexpr(num_split >= 4) cderi_3[output_idx1] = cderi_3[output_idx0];
+            __half out0, out1, out2, out3;
+            os_fp_split<num_split>(in_value, rho_int, &out0, &out1, &out2, &out3);
+            cderi_0[output_idx0] = out0;
+            if constexpr(num_split >= 2) cderi_1[output_idx0] = out1;
+            if constexpr(num_split >= 3) cderi_2[output_idx0] = out2;
+            if constexpr(num_split >= 4) cderi_3[output_idx0] = out3;
+            cderi_0[output_idx1] = out0;
+            if constexpr(num_split >= 2) cderi_1[output_idx1] = out1;
+            if constexpr(num_split >= 3) cderi_2[output_idx1] = out2;
+            if constexpr(num_split >= 4) cderi_3[output_idx1] = out3;
         }
     }
 }
@@ -345,42 +346,68 @@ void DF_J_build_work(
 }
 
 
+void sort_nnz_coord_by_blocks(
+    const int nnz, const int nrow, const int ncol, const int *rows, const int *cols,
+    const int blk_size, int *blk_nnz_displs, int *blk_nnz_orig_idx
+)
+{
+    int n_blk_row = (nrow + blk_size - 1) / blk_size;
+    int n_blk_col = (ncol + blk_size - 1) / blk_size;
+    int n_blk = n_blk_row * n_blk_col;
+    int *blk_idx = (int *) malloc(sizeof(int) * nnz);
+    int *blk_nnz_cnt = blk_nnz_displs + 1;
+    memset(blk_nnz_cnt, 0, sizeof(int) * n_blk);
+
+    for (int i = 0; i < nnz; i++)
+    {
+        int row_blk_i = rows[i] / blk_size;
+        int col_blk_i = cols[i] / blk_size;
+        int blk_idx_i = row_blk_i * n_blk_col + col_blk_i;
+        blk_idx[i] = blk_idx_i;
+        blk_nnz_cnt[blk_idx_i]++;
+    }
+
+    blk_nnz_displs[0] = 0;
+    for (int i = 1; i < n_blk; i++)
+        blk_nnz_cnt[i] += blk_nnz_cnt[i - 1];
+
+    for (int i = 0; i < nnz; i++)
+    {
+        int blk_idx_i = blk_idx[i];
+        int dst_idx = blk_nnz_displs[blk_idx_i];
+        blk_nnz_orig_idx[dst_idx] = i;
+        blk_nnz_displs[blk_idx_i]++;
+    }
+
+    for (int i = n_blk; i > 0; i--)
+        blk_nnz_displs[i] = blk_nnz_displs[i - 1];
+    blk_nnz_displs[0] = 0;
+}
+
+
 template<typename SplitType>
 void unpack_sym_split_cderi_work(
-    cudaStream_t stream, const int npair, const int *rows, const int *cols,
-    const int naux_blk, const int nrow, const double *cderi_sparse,
+    cudaStream_t stream, const int npair, const int *rows_d, const int *cols_d,
+    const int *blk_nnz_displs_d, const int *blk_nnz_orig_idx_d,
+    const int naux_blk, const int padded_nao, const double *cderi_sparse,
     const int num_split, SplitType *cderi_splits, const size_t cderi_split_size
 )
 {
     ERROR_CHECK(num_split >= 1 && num_split <= 4, "num_split must be between 1 and 4.");
 
-    if (npair != cderi_npair)
-    {
-        free(cderi_rows_h);
-        free(cderi_cols_h);
-        CUDA_CHECK( cudaFree(cderi_rows_d) );
-        CUDA_CHECK( cudaFree(cderi_cols_d) );
-        cderi_npair = npair;
-        size_t rc_bytes = sizeof(int) * npair;
-        cderi_rows_h = (int *) malloc(rc_bytes);
-        cderi_cols_h = (int *) malloc(rc_bytes);
-        CUDA_CHECK( cudaMalloc((void**) &cderi_rows_d, rc_bytes) );
-        CUDA_CHECK( cudaMalloc((void**) &cderi_cols_d, rc_bytes) );
-        memcpy(cderi_rows_h, rows, rc_bytes);
-        memcpy(cderi_cols_h, cols, rc_bytes);
-        CUDA_CHECK( cudaMemcpyAsync(cderi_rows_d, rows, rc_bytes, cudaMemcpyHostToDevice, stream) );
-        CUDA_CHECK( cudaMemcpyAsync(cderi_cols_d, cols, rc_bytes, cudaMemcpyHostToDevice, stream) );
-    }
-
     SPLIT_POINTERS(cderi_splits, cderi_split_size);
-    dim3 block(32, 32), grid(naux_blk);
-    double cd_bits = log2(nrow);
+    dim3 block(32, 32), grid;
+    double cd_bits = log2(padded_nao);
     double rho = ceil(52.0 - min(10.0, (23.0 - cd_bits) * 0.5));
     int rho_int = static_cast<int>(rho);
+    grid.x = (padded_nao + block.x - 1) / block.x;
+    grid.y = (padded_nao + block.y - 1) / block.y;
+    grid.z = naux_blk;
     #define DISPATCH_UNPACK_SYM_SPLIT_CDERI(InType, OutType, num_split) \
     do { \
         unpack_sym_split_cderi_kernel<num_split, InType, OutType><<<grid, block, 0, stream>>>( \
-            npair, cderi_rows_d, cderi_cols_d, nrow, \
+            npair, rows_d, cols_d, \
+            blk_nnz_displs_d, blk_nnz_orig_idx_d, padded_nao, \
             static_cast<const InType*>(cderi_sparse), rho_int, \
             static_cast<OutType*>(cderi_splits_0), \
             static_cast<OutType*>(cderi_splits_1), \
@@ -675,11 +702,32 @@ void DF_JK_build_work(
     CUDA_CHECK( cudaGetLastError() );
     #undef DISPATCH_SPLIT_FP_ARRAY
 
+    size_t nnz_idx_bytes = sizeof(int) * npair;
+    int *blk_nnz_displs = (int *) malloc(nnz_idx_bytes);  // Actually sizeof(int) * (n_blk + 1)
+    int *blk_nnz_orig_idx = (int *) malloc(nnz_idx_bytes);
+    sort_nnz_coord_by_blocks(
+        npair, padded_nao, padded_nao, rows, cols,
+        block.x, blk_nnz_displs, blk_nnz_orig_idx
+    );
+    int *rows_d = nullptr;
+    int *cols_d = nullptr;
+    int *blk_nnz_displs_d = nullptr;
+    int *blk_nnz_orig_idx_d = nullptr;
+    CUDA_CHECK( cudaMalloc((void**) &rows_d, nnz_idx_bytes) );
+    CUDA_CHECK( cudaMalloc((void**) &cols_d, nnz_idx_bytes) );
+    CUDA_CHECK( cudaMalloc((void**) &blk_nnz_displs_d, nnz_idx_bytes) );
+    CUDA_CHECK( cudaMalloc((void**) &blk_nnz_orig_idx_d, nnz_idx_bytes) );
+    CUDA_CHECK( cudaMemcpyAsync(rows_d, rows, nnz_idx_bytes, cudaMemcpyHostToDevice, stream) );
+    CUDA_CHECK( cudaMemcpyAsync(cols_d, cols, nnz_idx_bytes, cudaMemcpyHostToDevice, stream) );
+    CUDA_CHECK( cudaMemcpyAsync(blk_nnz_displs_d, blk_nnz_displs, nnz_idx_bytes, cudaMemcpyHostToDevice, stream) );
+    CUDA_CHECK( cudaMemcpyAsync(blk_nnz_orig_idx_d, blk_nnz_orig_idx, nnz_idx_bytes, cudaMemcpyHostToDevice, stream) );
+
     #define DISPATCH_UNPACK_SYM_SPLIT_CDERI_WORK(SplitType) \
     do { \
         unpack_sym_split_cderi_work<SplitType>( \
-            stream, npair, rows, cols, naux_blk, padded_nao, \
-            cderi_sparse_blk, num_split, \
+            stream, npair, rows_d, cols_d, \
+            blk_nnz_displs_d, blk_nnz_orig_idx_d, \
+            naux_blk, padded_nao, cderi_sparse_blk, num_split, \
             cderi_splits, padded_cderi_size \
         ); \
     } while (0)
@@ -708,6 +756,13 @@ void DF_JK_build_work(
     }
     #undef DISPATCH_UNPACK_SYM_SPLIT_CDERI_WORK
     #undef DISPATCH_DF_K_BUILD_WORK
+
+    free(blk_nnz_displs);
+    free(blk_nnz_orig_idx);
+    CUDA_CHECK( cudaFree(rows_d) );
+    CUDA_CHECK( cudaFree(cols_d) );
+    CUDA_CHECK( cudaFree(blk_nnz_displs_d) );
+    CUDA_CHECK( cudaFree(blk_nnz_orig_idx_d) );
 }
 
 // =============== C interface for Python ctypes ===============
