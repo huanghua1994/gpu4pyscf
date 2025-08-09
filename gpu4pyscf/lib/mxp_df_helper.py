@@ -18,27 +18,25 @@ _use_cuda_jk_build = os.getenv('MXP_DF_USE_CUDA_JK_BUILD', '1') == '1'
 
 cuda_device_cc = int(cupy.cuda.device.get_compute_capability())
 
-split_dtype_id_size_dict = {
+dtype_id_size_dict = {
     'FP64': (0, 8),
     'FP32': (1, 4),
-    'FP16': (2, 2),
-    'BF16': (3, 2),
 }
 
 non_flagship_gpu_mxp_strategies = {
-    0: ('FP64', 1, 0),   # Standard FP64, no split, no emulation
-    1: ('FP64', 1, 0),   # Standard FP64, no split, no emulation
-    2: ('FP64', 1, 39),  # Emulated FP64, 39 bits accuracy (~2e-12)
-    3: ('FP64', 1, 31),  # Emulated FP64, 31 bits accuracy (~4e-10)
-    4: ('FP64', 1, 23),  # Emulated FP64, 23 bits accuracy (~2e-7)
+    0: ('FP64', 0),   # Standard FP64, no split, no emulation
+    1: ('FP64', 0),   # Standard FP64, no split, no emulation
+    2: ('FP64', 39),  # Emulated FP64, 39 bits accuracy (~2e-12)
+    3: ('FP64', 31),  # Emulated FP64, 31 bits accuracy (~4e-10)
+    4: ('FP64', 23),  # Emulated FP64, 23 bits accuracy (~2e-7)
 }
 
 flagship_gpu_mxp_strategies = {
-    0: ('FP64', 1, 0),   # Standard FP64, no split, no emulation
-    1: ('FP64', 1, 0),   # Standard FP64, no split, no emulation
-    2: ('FP64', 1, 0),   # Standard FP64, no split, no emulation
-    3: ('FP64', 1, 0),   # Standard FP64, no split, no emulation
-    4: ('FP64', 1, 23),  # Emulated FP64, 23 bits accuracy (~2e-7)
+    0: ('FP64', 0),   # Standard FP64, no split, no emulation
+    1: ('FP64', 0),   # Standard FP64, no split, no emulation
+    2: ('FP64', 0),   # Standard FP64, no split, no emulation
+    3: ('FP64', 0),   # Standard FP64, no split, no emulation
+    4: ('FP64', 23),  # Emulated FP64, 23 bits accuracy (~2e-7)
 }
 
 def use_cuda_jk_build():
@@ -60,15 +58,15 @@ def get_gemm_padding(dim: int, alignment: int = 32) -> int:
     return (dim + alignment - 1) // alignment * alignment
 
 
-def mxp_df_level_to_split_dtype(mxp_df_level: int) -> Tuple[str, int, int]:
+def mxp_df_level_to_dtype_emu_bits(mxp_df_level: int) -> Tuple[str, int]:
     """
-    Get the split dtype and number of splits based on MxP DF level.
+    Get the compute dtype and FP64 emu bits based on MxP DF level.
 
     Args:
         mxp_df_level (int): Mixed-precision density fitting level.
 
     Returns:
-        Tuple[str, num_split, fp64_emu_bits]
+        Tuple[str, fp64_emu_bits]
     """
     if mxp_df_level < 0 or mxp_df_level > 4:
         raise ValueError(f"Unsupported MxP DF level: {mxp_df_level}. Supported levels are 0, 1, 2, 3, 4.")
@@ -109,8 +107,8 @@ def cuda_jk_build(
     rows_int32 = rows.astype(np.int32)
     cols_int32 = cols.astype(np.int32)
 
-    split_dtype_str, num_split, fp64_emu_bits = mxp_df_level_to_split_dtype(mxp_df_level)
-    split_dtype_id, split_dtype_bytes = split_dtype_id_size_dict[split_dtype_str]
+    split_dtype_str, fp64_emu_bits = mxp_df_level_to_dtype_emu_bits(mxp_df_level)
+    dtype_id, split_dtype_bytes = dtype_id_size_dict[split_dtype_str]
 
     use_Dmat = 1 if use_Dmat else 0
     build_J = 1 if build_J else 0
@@ -127,12 +125,12 @@ def cuda_jk_build(
     blk_size2 = get_gemm_padding(blk_size2-32, alignment=32)
     blk_size = min(blk_size, blk_size2)
     workbuf_bytes = 32 * 1024 * 1024 + 1024  # cuBLAS workspace and padding for alignment
-    workbuf_bytes += split_dtype_bytes * num_split * padded_nao_2  # C_or_D_splits
-    workbuf_bytes += split_dtype_bytes * num_split * blk_size * padded_nao_2  # cderi_splits
-    workbuf_bytes += split_dtype_bytes * num_split * blk_size * padded_nao_2  # rho_K_0_splits
-    workbuf_bytes += split_dtype_bytes * num_split * blk_size * padded_nao_2  # rho_K_splits
-    workbuf_bytes += split_dtype_bytes * num_split * padded_nao_2  # padded_K_splits
-    workbuf_bytes += 4 * num_split * blk_size * padded_nao_2  # fp32_out_splits
+    workbuf_bytes += split_dtype_bytes * padded_nao_2  # C_or_D_buf
+    workbuf_bytes += split_dtype_bytes * blk_size * padded_nao_2  # cderi_buf
+    workbuf_bytes += split_dtype_bytes * blk_size * padded_nao_2  # rho_K_0_buf
+    workbuf_bytes += split_dtype_bytes * blk_size * padded_nao_2  # rho_K_buf
+    workbuf_bytes += split_dtype_bytes * padded_nao_2  # padded_K_buf
+    workbuf_bytes += 4 * blk_size * padded_nao_2  # fp32_out_buf
     workbuf = cupy.empty(workbuf_bytes, dtype=cupy.uint8)
 
     err = libmxp_df_helper.DF_JK_build(
@@ -140,8 +138,8 @@ def cuda_jk_build(
         ctypes.c_int(naux),
         ctypes.c_int(nao),
         ctypes.c_int(nocc),
-        ctypes.c_int(num_split),
-        ctypes.c_int(split_dtype_id),
+        ctypes.c_int(blk_size),
+        ctypes.c_int(dtype_id),
         ctypes.c_int(fp64_emu_bits),
         ctypes.c_int(use_Dmat),
         ctypes.c_int(npair),
@@ -154,7 +152,6 @@ def cuda_jk_build(
         ctypes.c_int(build_K),
         ctypes.cast(J_mat_sparse_ptr, ctypes.c_void_p),
         ctypes.cast(K_mat_ptr, ctypes.c_void_p),
-        ctypes.c_int(blk_size),
         ctypes.cast(workbuf.data.ptr, ctypes.c_void_p),
     )
 
