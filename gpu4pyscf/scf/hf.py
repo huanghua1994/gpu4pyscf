@@ -264,11 +264,11 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
         rel_delta_e = abs(last_delta_e) / abs(last_hf_e)
         # Disable switch from lower level (higher accuracy) to higher level (lower accuracy)
         # TODO: need to tune
-        if mf.mxp_df_level == 4 and rel_delta_e > 2e-6:
+        if mf.mxp_df_level == 4 and rel_delta_e > 1e-6:
             mf.mxp_df_level = 4
-        elif mf.mxp_df_level >= 3 and rel_delta_e > 4e-9:
+        elif mf.mxp_df_level >= 3 and rel_delta_e > 1e-10:
             mf.mxp_df_level = 3
-        elif mf.mxp_df_level >= 2 and rel_delta_e > 2e-11:
+        elif mf.mxp_df_level >= 2 and rel_delta_e > 1e-11:
             mf.mxp_df_level = 2
         elif mf.mxp_df_level >= 1 and rel_delta_e > 7e-14:
             mf.mxp_df_level = 1
